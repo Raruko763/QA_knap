@@ -1,2 +1,4 @@
 data/
 out/
+__init__.py
+settings.json

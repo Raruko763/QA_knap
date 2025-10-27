@@ -155,7 +155,7 @@ class TSP:
         gen = VariableGenerator()
         x = gen.array("Binary", shape=(NUM_CITIES + 1, NUM_CITIES))
         x[NUM_CITIES, :] = x[0, :]
-        print("QUBO",x)
+        # print("QUBO",x)
         objective: Poly = einsum("ij,ni,nj->", self.distances, x[:-1], x[1:])  # type: ignore
         row_constraints = one_hot(x[:-1], axis=1,label='one_trip_constraint')
     # 最後の行を除いた q の各列のうち一つのみが 1 である制約
