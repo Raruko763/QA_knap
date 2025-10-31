@@ -1,151 +1,242 @@
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
 from amplify import FixstarsClient
 from src.vrpfactory import vrpfactory
 from src.knap_divpro import knap_dippro
 from TSP import TSP
-
-import matplotlib.pyplot as plt
+import time
 import json
 from datetime import timedelta, datetime
-
+import numpy as np
 
 class Core:
-    def __init__(self):
-        """Fixstars Amplifyクライアント設定"""
-        self.client = FixstarsClient()
-        self.client.token = "AE/Y0TY3dM834BNw0YGdHlkIg8oLsCvAsXB"
-        print("🔑 FixstarsClient initialized.")
-
-    def main(self):
-        import argparse
-        parser = argparse.ArgumentParser(description="Iterative QA-based CVRP optimizer (until convergence)")
-        parser.add_argument("-j", help="Path to before_data.json", type=str, required=True)
-        parser.add_argument("-sp", help="Base output directory (e.g. ./out)", type=str, required=True)
-        parser.add_argument("--t", help="Annealing time (ms)", default=3000, type=int)
-        parser.add_argument("-nt", help="Number of QA solves per iteration", default=3, type=int)
-        parser.add_argument("--p", help="QA parameter p", default=1.0, type=float)
-        parser.add_argument("--q", help="QA parameter q", default=1.0, type=float)
-        args = parser.parse_args()
-
-        # === 基本情報 ===
-        instance_name = os.path.splitext(os.path.basename(args.j))[0]
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_dir = os.path.join(args.sp, timestamp, instance_name)
-        os.makedirs(save_dir, exist_ok=True)
-
-        print(f"\n🚀 実験開始: {instance_name}")
-        print(f"📂 出力先: {save_dir}")
-
-        # === before_data.json から情報をロード ===
-        VRPfactory = vrpfactory()
-        (
-            cluster_nums, grax, gray, gra_distances,
-            x, y, distances, demands, capacity,
-            clusters, clusters_coordx, clusters_coordy, cluster_demands,
-            gra_clusters_coordx, gra_clusters_coordy, depo_x, depo_y
-        ) = VRPfactory.get_gluster_gravity_info(args.j)
-
-        nvehicle = 1
-        depo_x, depo_y = depo_x[0], depo_y[0]
-        self.client.parameters.timeout = timedelta(milliseconds=args.t)
-
-        # === 初期クラスタ順序 ===
-        tsp = TSP(self.client, gra_distances, demands, capacity, nvehicle, args.nt, cluster_nums, save_dir, grax, gray, args.j)
-        gra_result = tsp.des_TSP(args.p, args.q)
-        perms = gra_result["route"][1:]  # depot除外
-        print(f"🧭 Initial cluster order: {perms}")
-
-        prev_total_distance = None
-        iteration = 0
-        improvement_threshold = 1e-3
-        max_iterations = 50  # 念のため上限
-
-        while True:
-            iteration += 1
-            print(f"\n===== Iteration {iteration} =====")
-
-            # --- クラスタ間再配置 (QA) ---
-            for idx, current_cluster_index in enumerate(perms):
-                next_cluster_index = perms[(idx + 1) % len(perms)]
-                current_x, current_y = x[current_cluster_index], y[current_cluster_index]
-                current_demands = demands[current_cluster_index]
-                current_grax, current_gray = grax[current_cluster_index], gray[current_cluster_index]
-                next_x, next_y = x[next_cluster_index], y[next_cluster_index]
-                next_demands = demands[next_cluster_index]
-                next_grax, next_gray = grax[next_cluster_index], gray[next_cluster_index]
-
-                restcapacity = float(capacity - sum(next_demands))
-                distances_from_mycluster = vrpfactory.make_distances(current_x, current_y, current_grax, current_gray)
-                distances_from_nextcluster = vrpfactory.make_distances(current_x, current_y, next_grax, next_gray)
-
-                proccesor = knap_dippro(
-                    self.client, distances_from_mycluster, distances_from_nextcluster,
-                    current_demands, restcapacity, args.nt, current_x, args.j
-                )
-                pro_result = proccesor.QA_processors()
-
-                clusters, clusters_coordx, clusters_coordy, cluster_demands, gra_clusters_coordx, gra_clusters_coordy, distances = \
-                    VRPfactory.process_swap(
-                        pro_result["route"],
-                        clusters, clusters_coordx, clusters_coordy, cluster_demands,
-                        gra_clusters_coordx, gra_clusters_coordy,
-                        current_cluster_index, next_cluster_index, distances
-                    )
-
-            # --- 各クラスタ内TSP再計算 ---
-            total_distance = 0
-            tsp_routes = []
-            for cluster_id in range(len(clusters)):
-                coordx = [depo_x] + clusters_coordx[cluster_id]
-                coordy = [depo_y] + clusters_coordy[cluster_id]
-                cluster_demand = [0] + cluster_demands[cluster_id]
-                city_list = [0] + clusters[cluster_id]
-                cluster_distance = vrpfactory.make_cluster_distance_matrix(coordx, coordy)
-
-                tsp_solver = TSP(
-                    self.client, cluster_distance, cluster_demand, capacity,
-                    1, args.nt, city_list, save_dir, coordx, coordy, args.j
-                )
-                result = tsp_solver.solve_TSP(args.p, args.q)
-                tsp_routes.append(result)
-                total_distance += result["total_distances"]
-
-            print(f"📏 Total distance after iteration {iteration}: {total_distance:.3f}")
-
-            # --- 改善チェック ---
-            if prev_total_distance is not None:
-                improvement = prev_total_distance - total_distance
-                print(f"🟢 Improvement: {improvement:.6f}")
-
-                # まず結果を保存してから改善判定
-                iteration_path = os.path.join(save_dir, f"iteration_{iteration}.json")
-                with open(iteration_path, "w") as f:
-                    json.dump(tsp_routes, f, indent=4)
-                print(f"💾 Saved: {iteration_path}")
-
-                if abs(improvement) < improvement_threshold:
-                    print("⚠️ 改善が停止したため終了。")
-                    break
-            else:
-                # 1回目（prev_total_distanceがまだないとき）
-                iteration_path = os.path.join(save_dir, f"iteration_{iteration}.json")
-                with open(iteration_path, "w") as f:
-                    json.dump(tsp_routes, f, indent=4)
-                print(f"💾 Saved: {iteration_path}")
-
-            prev_total_distance = total_distance
-
-            if iteration >= max_iterations:
-                print("⚠️ 最大イテレーション数に達したため停止。")
-                break
-
-        print("\n✅ Optimization completed.")
-        print(f"📂 Results saved in: {save_dir}")
-
+   def __init__(self):
+       """Fixstars Amplifyクライアント設定"""
+       self.client = FixstarsClient()
+       self.client.token = "AE/Y0TY3dM834BNw0YGdHlkIg8oLsCvAsXB"
+       print("🔑 FixstarsClient initialized.")
+   @staticmethod
+   def to_native(o):
+       """NumPy系をPythonプリミティブに正規化"""
+       if isinstance(o, np.ndarray):
+           return o.tolist()
+       if isinstance(o, (np.integer,)):
+           return int(o)
+       if isinstance(o, (np.floating,)):
+           return float(o)
+       return o
+   @staticmethod
+   def to_native_tree(obj):
+       """入れ子構造ごと安全に変換"""
+       if isinstance(obj, dict):
+           return {k: Core.to_native_tree(v) for k, v in obj.items()}
+       if isinstance(obj, (list, tuple)):
+           return [Core.to_native_tree(v) for v in obj]
+       return Core.to_native(obj)
+   def main(self):
+       import argparse
+       parser = argparse.ArgumentParser(
+           description="Iterative QA-based CVRP optimizer with detailed timing logs"
+       )
+       parser.add_argument("-j",   help="Path to before_data.json",             type=str, required=True)
+       parser.add_argument("-sp",  help="Base output directory (e.g. ./out)",   type=str, required=True)
+       parser.add_argument("--t",  help="Annealing time (ms)",                  type=int, default=3000)
+       parser.add_argument("-nt",  help="QA solves per swap (num_solve)",       type=int, default=3)
+       parser.add_argument("--p",  help="QA parameter p",                       type=float, default=1.0)
+       parser.add_argument("--q",  help="QA parameter q",                       type=float, default=1.0)
+       parser.add_argument("--max_iter", help="Max iterations (safety cap)",    type=int, default=50)
+       parser.add_argument("--eps", help="Stop if improvement < eps",           type=float, default=1e-3)
+       args = parser.parse_args()
+       # === 出力ルート ===
+       instance_name = os.path.splitext(os.path.basename(args.j))[0]
+       timestamp     = datetime.now().strftime("%Y%m%d_%H%M%S")
+       save_dir      = os.path.join(args.sp, timestamp, instance_name)
+       os.makedirs(save_dir, exist_ok=True)
+       print(f"\n🚀 実験開始: {instance_name}")
+       print(f"📂 出力先: {save_dir}")
+       # === before_data.json 読み込み ===
+       VRPfactory = vrpfactory()
+       (
+           cluster_nums, grax, gray, gra_distances,
+           x, y, distances, demands, capacity,
+           clusters, clusters_coordx, clusters_coordy, cluster_demands,
+           gra_clusters_coordx, gra_clusters_coordy, depo_x, depo_y
+       ) = VRPfactory.get_gluster_gravity_info(args.j)
+       nvehicle = 1
+       depo_x, depo_y = depo_x[0], depo_y[0]
+       self.client.parameters.timeout = timedelta(milliseconds=args.t)
+       # === 初期クラスタ順序（重心TSPで決定） ===
+       tsp_over_clusters = TSP(
+           self.client, gra_distances, demands, capacity,
+           nvehicle, args.nt, cluster_nums, save_dir, grax, gray, args.j
+       )
+       gra_result = tsp_over_clusters.des_TSP(args.p, args.q)
+       perms = gra_result["route"][1:]  # depot(0)を除く
+       print(f"🧭 Initial cluster order: {perms}")
+       # ▼▼▼ ここで“重心のデータ”を保存（追加点）▼▼▼
+       centroid_payload = {
+           "instance": instance_name,
+           "params": {
+               "p": args.p, "q": args.q, "nt": args.nt, "anneal_ms": args.t
+           },
+           "clusters": Core.to_native_tree(cluster_nums),
+           "centroids": {
+               "x": Core.to_native_tree(grax),
+               "y": Core.to_native_tree(gray)
+           },
+           "route_over_centroids": {
+               "with_depot": Core.to_native_tree(gra_result["route"]),
+               "without_depot": Core.to_native_tree(perms)
+           },
+           "metrics": {
+               "total_time": Core.to_native(gra_result.get("total_time")),
+               "execution_time": Core.to_native(gra_result.get("execution_time")),
+               "response_time": Core.to_native(gra_result.get("response_time")),
+               "total_distances": Core.to_native(gra_result.get("total_distances"))
+           },
+           # NOTE: 距離行列は巨大なので形状だけ保存（必要ならコメント解除して全文保存）
+           "centroid_distance_shape": (
+               int(np.array(gra_distances).shape[0]),
+               int(np.array(gra_distances).shape[1])
+           )
+           # "centroid_distance_matrix": Core.to_native_tree(gra_distances),
+       }
+       centroid_path = os.path.join(save_dir, "centroid_init.json")
+       with open(centroid_path, "w") as f:
+           json.dump(centroid_payload, f, indent=2)
+       print(f"💾 重心データを保存: {centroid_path}")
+       # ▲▲▲ 追加ここまで ▲▲▲
+       prev_total_distance = None
+       iteration = 0
+       while True:
+           iteration += 1
+           print(f"\n===== Iteration {iteration} =====")
+           # 1) クラスタ間再配置（QA）— 詳細計測ログ
+           swap_time_log = []
+           for idx, current_cluster_index in enumerate(perms):
+               next_cluster_index = perms[(idx + 1) % len(perms)]
+               # 計測開始：クラスタペア確定直後
+               t_block_start = time.perf_counter()
+               # 現在と次のクラスタ情報
+               current_x, current_y = x[current_cluster_index], y[current_cluster_index]
+               current_demands      = demands[current_cluster_index]
+               current_grax, current_gray = grax[current_cluster_index], gray[current_cluster_index]
+               next_x, next_y       = x[next_cluster_index], y[next_cluster_index]
+               next_demands         = demands[next_cluster_index]
+               next_grax, next_gray = grax[next_cluster_index], gray[next_cluster_index]
+               # 次クラスタの残積載量
+               restcapacity = float(capacity - sum(next_demands))
+               # QA入力量
+               distances_from_mycluster   = vrpfactory.make_distances(current_x, current_y, current_grax, current_gray)
+               distances_from_nextcluster = vrpfactory.make_distances(current_x, current_y, next_grax, next_gray)
+               # QA 実行
+               proccesor = knap_dippro(
+                   self.client,
+                   distances_from_mycluster,
+                   distances_from_nextcluster,
+                   current_demands,
+                   restcapacity,
+                   args.nt,
+                   current_x,   # あなたの実装に合わせた「都市ID配列」
+                   args.j
+               )
+               pro_result = proccesor.QA_processors()
+               # moved_indices を安全化
+               moved_raw = pro_result.get("route", [])
+               if isinstance(moved_raw, np.ndarray):
+                   moved_indices = moved_raw.tolist()
+               else:
+                   moved_indices = list(moved_raw) if not isinstance(moved_raw, list) else moved_raw
+               try:
+                   moved_indices = [int(v) for v in moved_indices]
+               except Exception:
+                   moved_indices = [Core.to_native(v) for v in moved_indices]
+               # 計測
+               t_block_end = time.perf_counter()
+               block_ms = float((t_block_end - t_block_start) * 1000.0)
+               qa_total_time = pro_result.get("execution_time", 0.0)  # 秒想定
+               qa_ms = float(qa_total_time) * 1000.0
+               move_ms = max(block_ms - qa_ms, 0.0)
+               record = {
+                   "iteration":     int(iteration),
+                   "swap_index":    int(idx),
+                   "from_cluster":  int(current_cluster_index),
+                   "to_cluster":    int(next_cluster_index),
+                   "qa_ms":         float(qa_ms),
+                   "move_ms":       float(move_ms),
+                   "block_ms":      float(block_ms),
+                   "moved_indices": Core.to_native_tree(moved_indices),
+                   "n_city":        int(pro_result.get("n_city", 0))
+               }
+               swap_time_log.append(record)
+               print(f"[swap {idx}] QA={qa_ms:.2f}ms | move={move_ms:.2f}ms | total={block_ms:.2f}ms | moved={moved_indices}")
+               # スワップ適用
+               (clusters, clusters_coordx, clusters_coordy,
+                cluster_demands, gra_clusters_coordx, gra_clusters_coordy, distances) = \
+                   VRPfactory.process_swap(
+                       pro_result["route"],
+                       clusters, clusters_coordx, clusters_coordy, cluster_demands,
+                       gra_clusters_coordx, gra_clusters_coordy,
+                       current_cluster_index, next_cluster_index, distances
+                   )
+           # スワップ時間ログ保存（集計なし・生配列）
+           swap_log_path = os.path.join(save_dir, f"iteration_{iteration}_swap_timings.json")
+           with open(swap_log_path, "w") as f:
+               json.dump(Core.to_native_tree(swap_time_log), f, indent=2)
+           print(f"🕒 スワップ詳細を保存: {swap_log_path}")
+           # 2) 各クラスタ内TSPを解き直す
+           total_distance = 0.0
+           tsp_routes = []
+           for cluster_id in range(len(clusters)):
+               coordx = [depo_x] + clusters_coordx[cluster_id]
+               coordy = [depo_y] + clusters_coordy[cluster_id]
+               cluster_demand = [0] + cluster_demands[cluster_id]
+               city_list      = [0] + clusters[cluster_id]
+               cluster_distance = vrpfactory.make_cluster_distance_matrix(coordx, coordy)
+               tsp_solver = TSP(
+                   self.client,
+                   cluster_distance,
+                   cluster_demand,
+                   capacity,
+                   1,
+                   args.nt,
+                   city_list,
+                   save_dir,
+                   coordx,
+                   coordy,
+                   args.j
+               )
+               result = tsp_solver.solve_TSP(args.p, args.q)
+               tsp_routes.append({
+                   "cluster_id":      cluster_id,
+                   "route":           Core.to_native_tree(result["route"]),
+                   "total_time":      Core.to_native(result.get("total_time", None)),
+                   "execution_time":  Core.to_native(result.get("execution_time", None)),
+                   "response_time":   Core.to_native(result.get("response_time", None)),
+                   "total_distance":  Core.to_native(result.get("total_distances", None))
+               })
+               total_distance += float(result.get("total_distances", 0.0))
+           print(f"📏 Total distance after iteration {iteration}: {total_distance:.6f}")
+           # 3) TSP結果を保存（毎回）
+           iteration_path = os.path.join(save_dir, f"iteration_{iteration}.json")
+           with open(iteration_path, "w") as f:
+               json.dump(Core.to_native_tree(tsp_routes), f, indent=2)
+           print(f"💾 保存: {iteration_path}")
+           # 収束判定
+           if prev_total_distance is not None:
+               improvement = prev_total_distance - total_distance
+               print(f"🟢 Improvement: {improvement:.6f}")
+               if abs(improvement) < args.eps:
+                   print("⚠️ 改善が停止したため終了。")
+                   break
+           prev_total_distance = total_distance
+           if iteration >= args.max_iter:
+               print("⚠️ 最大イテレーション数に達したため停止。")
+               break
+       print("\n✅ Optimization completed.")
+       print(f"📂 Results saved in: {save_dir}")
 
 if __name__ == "__main__":
-    core = Core()
-    core.main()
+   core = Core()
+   core.main()

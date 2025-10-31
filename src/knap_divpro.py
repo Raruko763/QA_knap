@@ -91,7 +91,8 @@ class knap_dippro:
                     "total_time": total_time,
                     "execution_time": execution_time,
                     "response_time": response_time,
-                    "total_distances": total_distances
+                    "total_distances": total_distances,
+                    "n_city":n_mycluster
                 }
      
 
