@@ -77,14 +77,13 @@ class Core:
         )
         gra_result = tsp_over_clusters.des_TSP(args.p, args.q)
         perms = gra_result["route"][1:]  # depot(0)を除く
+        perms_native = [int(v) for v in np.array(perms).tolist()]
         print(f"🧭 Initial cluster order: {perms}")
 
         # 初期重心情報を保存（centroid_init.json）
         centroid_payload = {
             "instance": instance_name,
-            "params": {
-                "p": args.p, "q": args.q, "nt": args.nt, "anneal_ms": args.t
-            },
+            "params": {"p": args.p, "q": args.q, "nt": args.nt, "anneal_ms": args.t},
             "clusters": to_native(np.array(cluster_nums)),
             "centroids": {
                 "x": to_native(np.array(grax)),
@@ -92,7 +91,7 @@ class Core:
             },
             "route_over_centroids": {
                 "with_depot": to_native(np.array(gra_result["route"])),
-                "without_depot": perms,
+                "without_depot": perms_native,  # ← ここを置き換え
             },
             "metrics": {
                 "total_time": gra_result.get("total_time", None),
@@ -102,6 +101,7 @@ class Core:
             },
             "centroid_distance_shape": list(np.array(gra_distances).shape)
         }
+
         with open(os.path.join(save_dir, "centroid_init.json"), "w") as f:
             json.dump(centroid_payload, f, indent=2)
         print(f"💾 保存: {os.path.join(save_dir, 'centroid_init.json')}")
@@ -163,6 +163,7 @@ class Core:
                     distances_from_nextcluster,
                     current_demands,
                     restcapacity,
+                    capacity,
                     args.nt,
                     current_x,   # あなたの実装に合わせた「都市ID配列」相当
                     args.j

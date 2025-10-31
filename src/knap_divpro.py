@@ -16,13 +16,14 @@ import re
 
 class knap_dippro:
 
-    def __init__(self,client,distances_from_mycluster,distances_from_nextcluster,demands,restcapacity_of_nextcluster,num_solve,city,file_path):
+    def __init__(self,client,distances_from_mycluster,distances_from_nextcluster,demands,restcapacity_of_nextcluster,max_capacity,num_solve,city,file_path):
         self.client = client
         self.distances_from_mycluster = np.array(distances_from_mycluster,dtype=int)
         self.distances_from_nextcluster = np.array(distances_from_nextcluster,dtype=int)
         self.demands = demands
         self.num_solve = num_solve
         self.restcapacity_of_nextcluster =restcapacity_of_nextcluster
+        self.maxcapacity = max_capacity
         # self.x = x
         # self.y = y
         self.city = city
@@ -70,7 +71,7 @@ class knap_dippro:
         weight_sums = einsum("i,i->", demands, x)
         capacity_constraints: ConstraintList = less_equal(weight_sums, self.restcapacity_of_nextcluster, penalty_formulation="Relaxation",label='weight_sum')
         maxdit = max(np.amax(self.distances_from_mycluster),np.amax(self.distances_from_nextcluster))
-        capacity_constraints *= maxdit
+        capacity_constraints *= maxdit*self.maxcapacity/self.restcapacity_of_nextcluster
         model= Model(objective,capacity_constraints)
 
         result = solve(model,self.client)
