@@ -71,7 +71,7 @@ class knap_dippro:
         weight_sums = einsum("i,i->", demands, x)
         capacity_constraints: ConstraintList = less_equal(weight_sums, self.restcapacity_of_nextcluster, penalty_formulation="Relaxation",label='weight_sum')
         maxdit = max(np.amax(self.distances_from_mycluster),np.amax(self.distances_from_nextcluster))
-        capacity_constraints *= maxdit*self.maxcapacity/self.restcapacity_of_nextcluster
+        capacity_constraints *= maxdit
         model= Model(objective,capacity_constraints)
 
         result = solve(model,self.client)
