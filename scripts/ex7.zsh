@@ -53,7 +53,7 @@ for inst in "${INSTANCES[@]}"; do
   python3 src/Qknapcore.py \
     -j "$JSON_PATH" \
     -sp "$OUT_DIR" \
-    -nt 3 \
+    -nt 1 \
     --t 10000 \
     --max_iter 100
  
