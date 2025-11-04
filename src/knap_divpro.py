@@ -76,12 +76,7 @@ class knap_dippro:
 
         result = solve(model,self.client)
         x_values = result.best.values
-        # result.filter_solution = False
-        # result.best.feasible
-        # #解の取得と処理
-        # falcons = list(c for c in model.constraints if not c.is_satisfied(result.best.values))
-        # print(falcons)
-        # 結果の表示
+       
         swap_perms = x.evaluate(x_values)
         total_time= result.total_time.total_seconds()
         execution_time = result.execution_time.total_seconds()
@@ -132,22 +127,22 @@ class knap_dippro:
                 self.plot(route,result.best.objective,self.file_path,p,q,i)
 
             except RuntimeError:
-                # print("No feasible solution found.")
-                result.filter_solution = False
-                result.best.feasible
-                #解の取得と処理
-                falcons = list(c for c in model.constraints if not c.is_satisfied(result.best.values))
+                print("No feasible solution found.")
+                # result.filter_solution = False
+                # result.best.feasible
+                # #解の取得と処理
+                # falcons = list(c for c in model.constraints if not c.is_satisfied(result.best.values))
                 
-                constraints_data = []
+                # constraints_data = []
 
-                for constraint in falcons:
-                    constraints_data.append({
-                        "label": constraint.label,
-                        "conditional": str(constraint.conditional),  # 必要に応じて文字列化
-                        "weight": constraint.weight
-                    })
-                    self.ensure_directory_exists(self.file_path)
-                    self.save_to_json(p,q,i,constraints_data,self.file_path)
+                # for constraint in falcons:
+                #     constraints_data.append({
+                #         "label": constraint.label,
+                #         "conditional": str(constraint.conditional),  # 必要に応じて文字列化
+                #         "weight": constraint.weight
+                #     })
+                #     self.ensure_directory_exists(self.file_path)
+                #     self.save_to_json(p,q,i,constraints_data,self.file_path)
                     
         return route
 
