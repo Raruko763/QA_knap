@@ -114,36 +114,18 @@ class knap_dippro:
         model = objective + constraints
         for i in range(self.num_solve):
 
-            try:
-                result = solve(model, self.client)
-                if len(result) == 0:
-                    raise RuntimeError("At least one of the constraints is not satisfied.")
+            result = solve(model, self.client)
+            if len(result) == 0:
+                raise RuntimeError("At least one of the constraints is not satisfied.")
 
-                # result.best.objective
-                q_values = x.evaluate(result.best.values)
-                route = np.where(np.array(q_values) == 1)[1]
-                route = list(route)
-                print(route)
-                self.plot(route,result.best.objective,self.file_path,p,q,i)
+            # result.best.objective
+            q_values = x.evaluate(result.best.values)
+            route = np.where(np.array(q_values) == 1)[1]
+            route = list(route)
+            print(route)
+            self.plot(route,result.best.objective,self.file_path,p,q,i)
 
-            except RuntimeError:
-                print("No feasible solution found.")
-                # result.filter_solution = False
-                # result.best.feasible
-                # #解の取得と処理
-                # falcons = list(c for c in model.constraints if not c.is_satisfied(result.best.values))
-                
-                # constraints_data = []
-
-                # for constraint in falcons:
-                #     constraints_data.append({
-                #         "label": constraint.label,
-                #         "conditional": str(constraint.conditional),  # 必要に応じて文字列化
-                #         "weight": constraint.weight
-                #     })
-                #     self.ensure_directory_exists(self.file_path)
-                #     self.save_to_json(p,q,i,constraints_data,self.file_path)
-                    
+           
         return route
 
     def plot(self, route, total_distance,savedir,p,q,i):
