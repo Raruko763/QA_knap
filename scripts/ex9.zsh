@@ -17,6 +17,8 @@ INSTANCES=(
   # "X-n856-k95"
   "Leuven2"
   "X-n1001-k43"
+  "E-n101-k8"
+  "E-n76-k8"
 )
 # INSTANCES=(
 #   "E-n101-k14"
