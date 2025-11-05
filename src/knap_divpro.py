@@ -92,84 +92,145 @@ class knap_dippro:
                 }
      
 
-    def des_TSP(self,p,q):
+    def des_TSP(self, p, q):
+        """
+        TSP (1クラスタ内) を QUBO で解く — 直列実行(num_solves回)。
+        返り値: dict
+        - best: 最良解（全試行の中で objective が最小）
+        - runs: 各試行の最良解一覧（分布解析用）
+        - overall: solve呼び出し全体の時間など
+        """
         print("Solution is TSP.")
         NUM_CITIES = len(self.city)
-        # print("NUM_CITY",NUM_CITIES)
+
+        # 変数定義
         gen = VariableGenerator()
         x = gen.array("Binary", shape=(NUM_CITIES + 1, NUM_CITIES))
-        x[NUM_CITIES, :] = x[0, :]
-        # print("QUBO",x)
+        x[NUM_CITIES, :] = x[0, :]  # 巡回の最後→最初を同一行に縛る
+
+        # 目的関数：連続都市間の距離総和
         objective: Poly = einsum("ij,ni,nj->", self.distances, x[:-1], x[1:])  # type: ignore
-        row_constraints = one_hot(x[:-1], axis=1,label='one_trip_constraint')
-    # 最後の行を除いた q の各列のうち一つのみが 1 である制約
-        col_constraints = one_hot(x[:-1], axis=0,label='one_visit_constraint')
-            
-        constraints = p*row_constraints + q*col_constraints
 
-        # print("objective",objective)
-        # print("rowconstraint",row_constraints)
-        # print("colconstraint",col_constraints)
-        constraints *= np.amax(self.distances)  # 制約条件の強さを設定
+        # 制約：各時刻に1都市だけ訪問（行制約）＆各都市は1度だけ訪問（列制約）
+        row_constraints = one_hot(x[:-1], axis=1, label="one_trip_constraint")
+        col_constraints = one_hot(x[:-1], axis=0, label="one_visit_constraint")
+
+        # 制約強度（ペナルティ）を距離スケールに合わせて調整
+        constraints = p * row_constraints + q * col_constraints
+        constraints *= float(np.amax(self.distances))
+
+        # QUBOモデル
         model = objective + constraints
-        for i in range(self.num_solve):
 
-            result = solve(model, self.client)
-            if len(result) == 0:
-                raise RuntimeError("At least one of the constraints is not satisfied.")
+        # 直列実行（num_solve回）
+        result = solve(model, self.client, num_solves=self.num_solve)
 
-            # result.best.objective
-            q_values = x.evaluate(result.best.values)
-            route = np.where(np.array(q_values) == 1)[1]
-            route = list(route)
-            print(route)
-            self.plot(route,result.best.objective,self.file_path,p,q,i)
+        if len(result) == 0:
+            raise RuntimeError("At least one of the constraints is not satisfied.")
 
-           
-        return route
+        # ---- 最良解（全試行の中で最も良い） ----
+        best_sol = result.best
+        best_q = x.evaluate(best_sol.values)
+        best_route_idx = list(np.where(np.array(best_q) == 1)[1])  # 各時刻に選ばれた都市の列インデックス
+        # 必要なら巡回開始点を整形（任意）
+        if hasattr(self, "repair_circle_shift"):
+            best_route_idx = self.repair_circle_shift(best_route_idx)
+        best_route = [self.city[r] for r in best_route_idx]
 
-    def plot(self, route, total_distance,savedir,p,q,i):
-        # seaborn のスタイル設定
-        sns.set_theme(style="whitegrid")
+        # どの試行が最良だったか（インデックス）
+        best_run_index = min(
+            range(len(result.split)),
+            key=lambda i: result.split[i].best.objective
+        )
+
+        # ---- 全試行の結果（分布解析用） ----
+        runs = []
+        for i, r_i in enumerate(result.split):
+            best_i = r_i.best
+            q_i = x.evaluate(best_i.values)
+            route_i_idx = list(np.where(np.array(q_i) == 1)[1])
+            if hasattr(self, "repair_circle_shift"):
+                route_i_idx = self.repair_circle_shift(route_i_idx)
+            route_i = [self.city[r] for r in route_i_idx]
+
+            runs.append({
+                "run": i,
+                "total_distances": float(best_i.objective),
+                "total_time": r_i.total_time.total_seconds(),
+                "execution_time": r_i.execution_time.total_seconds(),
+                "response_time": r_i.response_time.total_seconds(),
+                "route_idx": route_i_idx,
+                "route": route_i,
+            })
+
+        # ---- 直列全体の時間情報 ----
+        overall = {
+            "total_time": result.total_time.total_seconds(),         # solve全体（壁時計）
+            "execution_time": result.execution_time.total_seconds(), # 直列合計
+            "response_time": result.response_time.total_seconds(),   # 直列合計
+            "num_solves": result.num_solves
+        }
+
+        # デバッグ出力（任意）
+        print(f"[BEST] run={best_run_index}, objective={float(best_sol.objective)}")
+        # print("best route idx:", best_route_idx)
+
+        return {
+            "best": {
+                "route": best_route,
+                "route_idx": best_route_idx,
+                "total_distances": float(best_sol.objective),
+                "best_run_index": best_run_index,
+                "total_time": overall["total_time"],
+                "execution_time": overall["execution_time"],
+                "response_time": overall["response_time"],
+            },
+            "runs": runs,
+            "overall": overall,
+        }
+
+    # def plot(self, route, total_distance,savedir,p,q,i):
+    #     # seaborn のスタイル設定
+    #     sns.set_theme(style="whitegrid")
     
-    # グラフをプロット
-        plt.figure(figsize=(10, 6))
+    # # グラフをプロット
+    #     plt.figure(figsize=(10, 6))
         
-        # 経路を描画
-        x = self.x
-        y = self.y
-        x_coords = [self.x[r] for r in route]  
-        y_coords = [self.y[r] for r in route]  
+    #     # 経路を描画
+    #     x = self.x
+    #     y = self.y
+    #     x_coords = [self.x[r] for r in route]  
+    #     y_coords = [self.y[r] for r in route]  
 
         
-        plt.plot(x_coords + [x_coords[0]], y_coords + [y_coords[0]], 'b-', marker='o')
+    #     plt.plot(x_coords + [x_coords[0]], y_coords + [y_coords[0]], 'b-', marker='o')
         
-        # 都市を描画
-        plt.scatter(x_coords, y_coords, c='r', zorder=5)
+    #     # 都市を描画
+    #     plt.scatter(x_coords, y_coords, c='r', zorder=5)
         
-        # 都市番号をプロット
-        for j in range(len(route[:-1])):
-            plt.text(x_coords[j] + 0.1, y_coords[j] + 0.1, str(self.city[route[j]]), fontsize=16, ha='center', va='center')
+    #     # 都市番号をプロット
+    #     for j in range(len(route[:-1])):
+    #         plt.text(x_coords[j] + 0.1, y_coords[j] + 0.1, str(self.city[route[j]]), fontsize=16, ha='center', va='center')
         
-        # タイトルにtotal_distanceを追加
-        plt.title(f'TSP Solution - Total Distance: {total_distance:.2f}', fontsize=18)
+    #     # タイトルにtotal_distanceを追加
+    #     plt.title(f'TSP Solution - Total Distance: {total_distance:.2f}', fontsize=18)
     
-        # 軸ラベルの設定
-        plt.xlabel('X')
-        plt.ylabel('Y')
-        # グラフの表示
+    #     # 軸ラベルの設定
+    #     plt.xlabel('X')
+    #     plt.ylabel('Y')
+    #     # グラフの表示
 
-        # savedir の親ディレクトリを取得
-        parent_dir = os.path.dirname(savedir)
+    #     # savedir の親ディレクトリを取得
+    #     parent_dir = os.path.dirname(savedir)
 
-        match = re.search(r"cluster_\d+", self.clu_path)
-        if match:
-            # 最終的な保存先のパスを作成
-            save_path = os.path.join(parent_dir, f"route_{match.group()}_{i}_{p}_{q}.pdf")
+    #     match = re.search(r"cluster_\d+", self.clu_path)
+    #     if match:
+    #         # 最終的な保存先のパスを作成
+    #         save_path = os.path.join(parent_dir, f"route_{match.group()}_{i}_{p}_{q}.pdf")
 
-        # 親ディレクトリが存在しない場合は作成
-        # os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig("E-n51-k5_gravity_plot.pdf")
+    #     # 親ディレクトリが存在しない場合は作成
+    #     # os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    #     plt.savefig("E-n51-k5_gravity_plot.pdf")
 
 
 
