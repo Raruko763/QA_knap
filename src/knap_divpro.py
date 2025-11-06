@@ -100,7 +100,7 @@ class knap_dippro:
         - runs: 各試行の最良解一覧（分布解析用）
         - overall: solve呼び出し全体の時間など
         """
-        print("Solution is TSP.")
+        print("Solution is TSP.",self.num_solve)
         NUM_CITIES = len(self.city)
 
         # 変数定義
@@ -142,7 +142,7 @@ class knap_dippro:
             range(len(result.split)),
             key=lambda i: result.split[i].best.objective
         )
-
+        print("solvetime", len(result.split))
         # ---- 全試行の結果（分布解析用） ----
         runs = []
         for i, r_i in enumerate(result.split):
@@ -176,18 +176,15 @@ class knap_dippro:
         # print("best route idx:", best_route_idx)
 
         return {
-            "best": {
-                "route": best_route,
-                "route_idx": best_route_idx,
-                "total_distances": float(best_sol.objective),
-                "best_run_index": best_run_index,
-                "total_time": overall["total_time"],
-                "execution_time": overall["execution_time"],
-                "response_time": overall["response_time"],
-            },
-            "runs": runs,
-            "overall": overall,
+            "route": best_route,
+            "total_time": result.total_time.total_seconds(),
+            "execution_time": result.execution_time.total_seconds(),
+            "response_time": result.response_time.total_seconds(),
+            "total_distances": float(best_sol.objective),
+            "runs": runs,          # 各試行の最良解
+            "overall": overall     # 直列全体の時間情報
         }
+
 
     # def plot(self, route, total_distance,savedir,p,q,i):
     #     # seaborn のスタイル設定

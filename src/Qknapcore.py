@@ -261,7 +261,10 @@ class Core:
                     "total_time":      result.get("total_time", None),
                     "execution_time":  result.get("execution_time", None),
                     "response_time":   result.get("response_time", None),
-                    "total_distance":  result.get("total_distances", None)
+                    "total_distance":  result.get("total_distances", None),
+                    "overall": result.get("overall", {}),
+                    "runs": result.get("runs", []),
+
                 })
                 total_distance += float(result.get("total_distances", 0.0))
 

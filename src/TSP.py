@@ -58,87 +58,100 @@ class TSP:
     #     for vehicle, route in best_tour.items():
     #         total_distance = calculate_total_distance(route, distance_matrix)
     #         print(f"Total distance for vehicle {vehicle}: {total_distance}")
-    def solve_TSP(self,p,q):
-        print("Solution is TSP.")
+    def des_TSP(self, p, q):
+        """
+        TSP (1クラスタ内) を QUBO で解く — 直列実行(num_solves回)。
+        返り値: dict
+        - best: 最良解（全試行の中で objective が最小）
+        - runs: 各試行の最良解一覧（分布解析用）
+        - overall: solve呼び出し全体の時間など
+        """
+        print("Solution is TSP.",self.num_solve)
         NUM_CITIES = len(self.city)
-        # print("NUM_CITY",NUM_CITIES)
+
+        # 変数定義
         gen = VariableGenerator()
         x = gen.array("Binary", shape=(NUM_CITIES + 1, NUM_CITIES))
-        x[NUM_CITIES, :] = x[0, :]
-        # print("QUBO",x)
+        x[NUM_CITIES, :] = x[0, :]  # 巡回の最後→最初を同一行に縛る
+
+        # 目的関数：連続都市間の距離総和
         objective: Poly = einsum("ij,ni,nj->", self.distances, x[:-1], x[1:])  # type: ignore
-        row_constraints = one_hot(x[:-1], axis=1,label='one_trip_constraint')
-    # 最後の行を除いた q の各列のうち一つのみが 1 である制約
-        col_constraints = one_hot(x[:-1], axis=0,label='one_visit_constraint')
-            
-        constraints = p*row_constraints + q*col_constraints
 
-        # print("objective",objective)
-        # print("rowconstraint",row_constraints)
-        # print("colconstraint",col_constraints)
-        constraints *= np.amax(self.distances)  # 制約条件の強さを設定
+        # 制約：各時刻に1都市だけ訪問（行制約）＆各都市は1度だけ訪問（列制約）
+        row_constraints = one_hot(x[:-1], axis=1, label="one_trip_constraint")
+        col_constraints = one_hot(x[:-1], axis=0, label="one_visit_constraint")
+
+        # 制約強度（ペナルティ）を距離スケールに合わせて調整
+        constraints = p * row_constraints + q * col_constraints
+        constraints *= float(np.amax(self.distances))
+
+        # QUBOモデル
         model = objective + constraints
-        for i in range(self.num_solve):
 
-            try:
-                result = solve(model, self.client)
-                if len(result) == 0:
-                    raise RuntimeError("At least one of the constraints is not satisfied.")
+        # 直列実行（num_solve回）
+        result = solve(model, self.client, num_solves=self.num_solve)
 
-                # result.best.objective
-                q_values = x.evaluate(result.best.values)
-                route = np.where(np.array(q_values) == 1)[1]
-                route = list(route)
-                # print("pre_route :",route)
-                route = self.repair_circle_shift(route)
-                new_route = []
-                for r in route:
-                    new_route.append(self.city[r])
-                total_time= result.total_time.total_seconds()
-                execution_time = result.execution_time.total_seconds()
-                response_time = result.response_time.total_seconds()
-                total_distances =result.best.objective
-                return {
-                    "route": new_route,
-                    "total_time": total_time,
-                    "execution_time": execution_time,
-                    "response_time": response_time,
-                    "total_distances": total_distances
-                }
-                # new_route = []
-                # for r in route:
-                #     new_route.append(self.city[r])
-                # # print(route)
-                # # print(new_route)
-                # other_datas = {
-                #         'route':new_route,
-                #         'total_time': result.total_time.total_seconds(),
-                #         'execution_time': result.execution_time.total_seconds(),
-                #         'response_time': result.response_time.total_seconds(),
-                #         'total_distances': result.best.objective
-                #     }
-                # self.plot(route,result.best.objective,self.file_path,p,q,i)
-                # self.ensure_directory_exists(self.file_path)
-                # self.save_to_json(p,q,i,other_datas,self.file_path)
-            except RuntimeError:
-                print("No feasible solution found.")
-        #         result.filter_solution = False
-        #         result.best.feasible
-        #         #解の取得と処理
-        #         falcons = list(c for c in model.constraints if not c.is_satisfied(result.best.values))
-                
-        #         constraints_data = []
+        if len(result) == 0:
+            raise RuntimeError("At least one of the constraints is not satisfied.")
 
-        #         for constraint in falcons:
-        #             constraints_data.append({
-        #                 "label": constraint.label,
-        #                 "conditional": str(constraint.conditional),  # 必要に応じて文字列化
-        #                 "weight": constraint.weight
-        #             })
-        #             self.ensure_directory_exists(self.file_path)
-        #             self.save_to_json(p,q,i,constraints_data,self.file_path)
-                    
-        # return other_datas
+        # ---- 最良解（全試行の中で最も良い） ----
+        best_sol = result.best
+        best_q = x.evaluate(best_sol.values)
+        best_route_idx = list(np.where(np.array(best_q) == 1)[1])  # 各時刻に選ばれた都市の列インデックス
+        # 必要なら巡回開始点を整形（任意）
+        if hasattr(self, "repair_circle_shift"):
+            best_route_idx = self.repair_circle_shift(best_route_idx)
+        best_route = [self.city[r] for r in best_route_idx]
+
+        # どの試行が最良だったか（インデックス）
+        best_run_index = min(
+            range(len(result.split)),
+            key=lambda i: result.split[i].best.objective
+        )
+        print("solvetime", len(result.split))
+        # ---- 全試行の結果（分布解析用） ----
+        runs = []
+        for i, r_i in enumerate(result.split):
+            best_i = r_i.best
+            q_i = x.evaluate(best_i.values)
+            route_i_idx = list(np.where(np.array(q_i) == 1)[1])
+            if hasattr(self, "repair_circle_shift"):
+                route_i_idx = self.repair_circle_shift(route_i_idx)
+            route_i = [self.city[r] for r in route_i_idx]
+
+            runs.append({
+                "run": i,
+                "total_distances": float(best_i.objective),
+                "total_time": r_i.total_time.total_seconds(),
+                "execution_time": r_i.execution_time.total_seconds(),
+                "response_time": r_i.response_time.total_seconds(),
+                "route_idx": route_i_idx,
+                "route": route_i,
+            })
+
+        # ---- 直列全体の時間情報 ----
+        overall = {
+            "total_time": result.total_time.total_seconds(),         # solve全体（壁時計）
+            "execution_time": result.execution_time.total_seconds(), # 直列合計
+            "response_time": result.response_time.total_seconds(),   # 直列合計
+            "num_solves": result.num_solves
+        }
+
+        # デバッグ出力（任意）
+        print(f"[BEST] run={best_run_index}, objective={float(best_sol.objective)}")
+        # print("best route idx:", best_route_idx)
+
+        return {
+            "route": best_route,
+            "total_time": result.total_time.total_seconds(),
+            "execution_time": result.execution_time.total_seconds(),
+            "response_time": result.response_time.total_seconds(),
+            "total_distances": float(best_sol.objective),
+            "runs": runs,          # 各試行の最良解
+            "overall": overall     # 直列全体の時間情報
+        }
+
+
 
     def repair_circle_shift(self,route):
 
@@ -168,40 +181,40 @@ class TSP:
         # print("colconstraint",col_constraints)
         constraints *= np.amax(self.distances)  # 制約条件の強さを設定
         model = objective + constraints
-        for i in range(self.num_solve):
+        # for i in range(self.num_solve):
 
-            try:
-                result = solve(model, self.client)
-                if len(result) == 0:
-                    raise RuntimeError("At least one of the constraints is not satisfied.")
+        #     try:
+        result = solve(model, self.client)
+        if len(result) == 0:
+            raise RuntimeError("At least one of the constraints is not satisfied.")
 
-                # result.best.objective
-                q_values = x.evaluate(result.best.values)
-                route = np.where(np.array(q_values) == 1)[1]
-                route = list(route)
-                print(route)
-                # self.plot(route,result.best.objective,self.file_path,p,q,i)
-                total_time= result.total_time.total_seconds()
-                execution_time = result.execution_time.total_seconds()
-                response_time = result.response_time.total_seconds()
-                total_distances =result.best.objective
-            except RuntimeError:
-                # print("No feasible solution found.")
-                result.filter_solution = False
-                result.best.feasible
-                #解の取得と処理
-                falcons = list(c for c in model.constraints if not c.is_satisfied(result.best.values))
+        # result.best.objective
+        q_values = x.evaluate(result.best.values)
+        route = np.where(np.array(q_values) == 1)[1]
+        route = list(route)
+        print(route)
+        # self.plot(route,result.best.objective,self.file_path,p,q,i)
+        total_time= result.total_time.total_seconds()
+        execution_time = result.execution_time.total_seconds()
+        response_time = result.response_time.total_seconds()
+        total_distances =result.best.objective
+        #     except RuntimeError:
+        #         # print("No feasible solution found.")
+        #         result.filter_solution = False
+        #         result.best.feasible
+        #         #解の取得と処理
+        #         falcons = list(c for c in model.constraints if not c.is_satisfied(result.best.values))
                 
-                constraints_data = []
+        #         constraints_data = []
 
-                for constraint in falcons:
-                    constraints_data.append({
-                        "label": constraint.label,
-                        "conditional": str(constraint.conditional),  # 必要に応じて文字列化
-                        "weight": constraint.weight
-                    })
-                    self.ensure_directory_exists(self.file_path)
-                    self.save_to_json(p,q,i,constraints_data,self.file_path)
+        #         for constraint in falcons:
+        #             constraints_data.append({
+        #                 "label": constraint.label,
+        #                 "conditional": str(constraint.conditional),  # 必要に応じて文字列化
+        #                 "weight": constraint.weight
+        #             })
+        #             self.ensure_directory_exists(self.file_path)
+        #             self.save_to_json(p,q,i,constraints_data,self.file_path)
         
         return  {
                     "route": route,
