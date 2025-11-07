@@ -5,6 +5,7 @@ import argparse
 from pathlib import Path
 import matplotlib.pyplot as plt
 import csv
+import re
 
 def extract_total_distance(json_file):
     """Return sum of 'total_distance(s)' from iteration_X.json (list of per-cluster dicts)."""
@@ -80,7 +81,10 @@ def scan_and_plot(base_dir, output_index=True):
             fname_base = f"{safe_name(instance)}__{safe_name(ts)}"
 
             itr_files = sorted(
-                [f for f in inst_dir.iterdir() if f.is_file() and f.name.startswith("iteration_") and f.suffix == ".json"],
+                [f for f in inst_dir.iterdir() if f.is_file() 
+                 and f.name.startswith("iteration_") and f.suffix == ".json" 
+                 and "timings" not in f.name
+                 ],
                 key=lambda p: int(p.stem.split("_")[1])
             )
             if not itr_files:
