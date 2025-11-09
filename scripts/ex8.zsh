@@ -15,7 +15,7 @@ set -euo pipefail
 # )
 INSTANCES=(
   "Leuven2"
-   "X-n1001-k4"
+  "X-n1001-k43"
   "E-n51-k5"
   "E-n76-k8"
   "E-n76-k14"
