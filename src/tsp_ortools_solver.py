@@ -1,42 +1,51 @@
-# src/tsp_ortools_solver.py
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
-import numpy as np
+import time
 
-# src/tsp_ortools_solver.py
-from ortools.constraint_solver import pywrapcp, routing_enums_pb2
-
-def solve_tsp_ortools(distance_matrix, time_limit_ms=10, seed=42):
+def solve_tsp_ortools(distance_matrix, time_limit_ms=2000):
+    """Solve TSP with OR-Tools and return route + distance + timing."""
     n = len(distance_matrix)
+    if n == 0:
+        return {"route": [], "total_distance": 0.0, "solver_status": "EMPTY"}
+
     manager = pywrapcp.RoutingIndexManager(n, 1, 0)
     routing = pywrapcp.RoutingModel(manager)
 
-    def distance_callback(i, j):
-        return int(distance_matrix[manager.IndexToNode(i)][manager.IndexToNode(j)] * 1000)
-    transit_idx = routing.RegisterTransitCallback(distance_callback)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
+    def dist_callback(from_index, to_index):
+        f, t = manager.IndexToNode(from_index), manager.IndexToNode(to_index)
+        return int(distance_matrix[f][t])
 
-    params = pywrapcp.DefaultRoutingSearchParameters()
-    params.time_limit.FromMilliseconds(time_limit_ms)
-    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    params.log_search = False
+    transit_callback_index = routing.RegisterTransitCallback(dist_callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-    # --- 互換化: OR-Tools の版によって random_seed が無い ---
-    try:
-        params.random_seed = seed                # ある版
-    except AttributeError:
-        # 代替：存在する場合のみ設定（例: use_random_number_generator 等）
-        if hasattr(params, "use_random_number_generator"):
-            setattr(params, "use_random_number_generator", True)
-        # 乱数種は未設定のままでOK（解は普通に出ます）
+    search_params = pywrapcp.DefaultRoutingSearchParameters()
+    search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    search_params.time_limit.seconds = time_limit_ms // 1000
+    search_params.time_limit.milliseconds = time_limit_ms % 1000
 
-    solution = routing.SolveWithParameters(params)
+    start_time = time.perf_counter()
+    solution = routing.SolveWithParameters(search_params)
+    end_time = time.perf_counter()
 
-    route = []
-    if solution:
-        idx = routing.Start(0)
-        while not routing.IsEnd(idx):
-            route.append(manager.IndexToNode(idx))
-            idx = solution.Value(routing.NextVar(idx))
-        route.append(0)  # 閉路
-    return route
+    if not solution:
+        return {
+            "route": [],
+            "total_distance": None,
+            "solver_status": "NO_SOLUTION",
+            "solve_time_ms": (end_time - start_time) * 1000.0
+        }
+
+    route, total_distance = [], 0
+    index = routing.Start(0)
+    while not routing.IsEnd(index):
+        route.append(manager.IndexToNode(index))
+        next_index = solution.Value(routing.NextVar(index))
+        total_distance += routing.GetArcCostForVehicle(index, next_index, 0)
+        index = next_index
+    route.append(manager.IndexToNode(index))
+
+    return {
+        "route": route,
+        "total_distance": float(total_distance),
+        "solver_status": "SUCCESS",
+        "solve_time_ms": (end_time - start_time) * 1000.0
+    }

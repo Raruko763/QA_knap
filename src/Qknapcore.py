@@ -331,8 +331,10 @@ class Core:
                         route = ort
                         tot = None
 
-                    route = [int(v) for v in (route or [])]
-                    tot = float(tot) if tot is not None else compute_route_distance(route, cluster_distance)
+                    route = ort.get("route", [])
+                    tot = ort.get("total_distance")
+                    solver_status = ort.get("solver_status", "")
+                    solve_time_ms = ort.get("solve_time_ms", None)
 
                     tsp_routes.append({
                         "cluster_id":     int(cluster_id),
@@ -340,6 +342,7 @@ class Core:
                         "total_distance": tot,
                         "solver":         "ortools",
                         "solver_status":  solver_status,
+                        "solve_time_ms":  solve_time_ms
                     })
                     total_distance += tot
             else:
