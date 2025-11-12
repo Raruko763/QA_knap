@@ -29,7 +29,8 @@ except Exception as e:
 
 from src.vrpfactory import vrpfactory
 from src.knap_divpro import knap_dippro
-from TSP import TSP
+# from TSP import TSP  # ← QUBO版TSPは使わない
+from src.tsp_ortools import solve_tsp_ortools
 
 
 # ---------- utils ----------
@@ -64,6 +65,18 @@ def normalize_moved(raw, length: int) -> np.ndarray:
     return mask
 
 
+def compute_route_distance(route: List[int], distance_matrix) -> float:
+    """Return total distance for a route (auto-closes if needed)."""
+    if not route:
+        return 0.0
+    total = 0.0
+    for i in range(len(route) - 1):
+        total += float(distance_matrix[route[i]][route[i + 1]])
+    if route[0] != route[-1]:
+        total += float(distance_matrix[route[-1]][route[0]])
+    return total
+
+
 # ---------- core ----------
 class Core:
     def __init__(self):
@@ -87,6 +100,10 @@ class Core:
         ap.add_argument("--p",  help="QA parameter p",                       type=float, default=1.0)
         ap.add_argument("--q",  help="QA parameter q",                       type=float, default=1.0)
         ap.add_argument("--max_iter", help="Max iterations",                 type=int, default=50)
+        ap.add_argument("--tsp_solver", choices=["ortools", "amplify"], default="ortools",
+                        help="TSP solver: use 'ortools' to avoid QUBO")
+        ap.add_argument("--tsp_time_limit_ms", type=int, default=2000,
+                        help="OR-Tools time limit per cluster (ms)")
         ap.add_argument("--eps", help="(unused, compat)",                    type=float, default=1e-3)
         args = ap.parse_args()
 
@@ -116,6 +133,8 @@ class Core:
         self.client.parameters.timeout = timedelta(milliseconds=args.t)
 
         # === Initial centroid-level TSP (cluster order) ===
+        # 既存の「重心TSP」部分は変更せずAmplify版を利用
+        from TSP import TSP
         tsp_over_clusters = TSP(
             self.client, gra_distances, demands, capacity,
             nvehicle, args.nt, cluster_nums, str(save_dir), grax, gray, str(before_path)
@@ -160,6 +179,7 @@ class Core:
             print(f"\n===== Iteration {iteration} =====")
             swap_time_log: List[Dict[str, Any]] = []
             moved_total = 0
+            touched_clusters = set()  # この反復で内容が変わった(=TSP解く対象)
 
             # Adjacency along perms
             for idx, current_cluster_index in enumerate(perms):
@@ -229,6 +249,9 @@ class Core:
                 did_move = bool(moved_arr.sum() > 0.5)
                 if did_move:
                     moved_total += 1
+                    # from側とto側の2クラスタは内容が変わるので記録
+                    touched_clusters.add(int(current_cluster_index))
+                    touched_clusters.add(int(next_cluster_index))
 
                 # Timing
                 t_block_end = time.perf_counter()
@@ -278,9 +301,9 @@ class Core:
                 print(f"[swap {idx}] move={did_move} | qa={qa_ms:.1f}ms | total={block_ms:.1f}ms | "
                       f"before={sum_before:.3f} | after={sum_after:.3f}")
 
-            # If nothing moved at all, end.
+            # 都市交換が発生しなかったら、このイテレーションでは TSP を解かず終了
             if moved_total == 0:
-                print("🟡 No city moved in this iteration → stop optimization.")
+                print("🟡 No city moved in this iteration → stop optimization (skip TSP solving).")
                 break
 
             # Save swap timings for this iteration (robust json)
@@ -289,48 +312,57 @@ class Core:
                 json.dump(swap_time_log, f, indent=2, default=to_native)
             print(f"🕒 Saved swap details: {swap_log_path}")
 
-            # Re-solve TSP per cluster and save per-iteration summary
+            # 交換があったクラスタのみ TSP を解く（OR-Tools 既定）
             total_distance = 0.0
             tsp_routes: List[Dict[str, Any]] = []
-            for cluster_id in range(len(clusters)):
-                coordx = [depo_x] + clusters_coordx[cluster_id]
-                coordy = [depo_y] + clusters_coordy[cluster_id]
-                cluster_demand = [0] + cluster_demands[cluster_id]
-                city_list      = [0] + clusters[cluster_id]
+            if args.tsp_solver == "ortools":
+                for cluster_id in sorted(touched_clusters):
+                    coordx = [depo_x] + clusters_coordx[cluster_id]
+                    coordy = [depo_y] + clusters_coordy[cluster_id]
+                    cluster_distance = vrpfactory.make_cluster_distance_matrix(coordx, coordy)
 
-                cluster_distance = vrpfactory.make_cluster_distance_matrix(coordx, coordy)
+                    ort = solve_tsp_ortools(cluster_distance, time_limit_ms=args.tsp_time_limit_ms)
+                    solver_status = ""
+                    if isinstance(ort, dict):
+                        route = ort.get("route", [])
+                        tot = ort.get("total_distance")
+                        solver_status = ort.get("solver_status", "")
+                    else:
+                        route = ort
+                        tot = None
 
-                tsp_solver = TSP(
-                    self.client,
-                    cluster_distance,
-                    cluster_demand,
-                    capacity,
-                    1,               # single vehicle within cluster
-                    args.nt,
-                    city_list,
-                    str(save_dir),
-                    coordx,
-                    coordy,
-                    str(before_path)
-                )
-                result = tsp_solver.solve_TSP(args.p, args.q)
-                rec = {
-                    "cluster_id":      int(cluster_id),
-                    "route":           to_native(result.get("route")),
-                    "total_time":      to_native(result.get("total_time")),
-                    "execution_time":  to_native(result.get("execution_time")),
-                    "response_time":   to_native(result.get("response_time")),
-                    "total_distance":  to_native(result.get("total_distances")),
-                    "overall":         to_native(result.get("overall", {})),
-                    "runs":            to_native(result.get("runs", [])),
-                }
-                tsp_routes.append(rec)
-                try:
+                    route = [int(v) for v in (route or [])]
+                    tot = float(tot) if tot is not None else compute_route_distance(route, cluster_distance)
+
+                    tsp_routes.append({
+                        "cluster_id":     int(cluster_id),
+                        "route":          route,
+                        "total_distance": tot,
+                        "solver":         "ortools",
+                        "solver_status":  solver_status,
+                    })
+                    total_distance += tot
+            else:
+                # 互換のために amplify(TSP) を選べるよう残す（必要なら）
+                from TSP import TSP
+                for cluster_id in sorted(touched_clusters):
+                    coordx = [depo_x] + clusters_coordx[cluster_id]
+                    coordy = [depo_y] + clusters_coordy[cluster_id]
+                    cluster_demand = [0] + cluster_demands[cluster_id]
+                    city_list = [0] + clusters[cluster_id]
+                    cluster_distance = vrpfactory.make_cluster_distance_matrix(coordx, coordy)
+                    tsp_solver = TSP(self.client, cluster_distance, cluster_demand, capacity,
+                                     1, args.nt, city_list, str(save_dir), coordx, coordy, str(before_path))
+                    result = tsp_solver.solve_TSP(args.p, args.q)
+                    tsp_routes.append({
+                        "cluster_id":     int(cluster_id),
+                        "route":          to_native(result.get("route")),
+                        "total_distance": float(result.get("total_distances", 0.0)),
+                        "solver":         "amplify",
+                    })
                     total_distance += float(result.get("total_distances", 0.0))
-                except Exception:
-                    pass
 
-            print(f"📏 Total distance after iteration {iteration}: {total_distance:.6f}")
+            print(f"📏 Total distance (touched clusters only) after iteration {iteration}: {total_distance:.6f}")
             iteration_path = save_dir / f"iteration_{iteration}.json"
             with open(iteration_path, "w") as f:
                 json.dump(tsp_routes, f, indent=2, default=to_native)
