@@ -2,3 +2,9 @@ data/
 out/
 __init__.py
 settings.json
+*.tour
+*.par
+*.png
+*.csv
+LKH3-3.0.6/
+*.log

@@ -7,8 +7,8 @@ from shutil import which
 import numpy as np
 
 
-def solve_tsp_lkh(dist_matrix, work_dir, time_limit_ms=2000,
-                  runs=1, seed=12345, lkh_bin=None):
+def solve_tsp_lkh(dist_matrix, work_dir, time_limit_ms=3000,
+                  runs=20, seed=12345, lkh_bin=None):
     """
     LKH を使って TSP を解く（距離行列 → EXPLICIT TSPLIB → LKH実行）
 
