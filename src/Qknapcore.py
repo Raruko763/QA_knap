@@ -110,7 +110,10 @@ class Core:
         # === Output dir ===
         before_path = Path(args.j).resolve()
         parent_name = before_path.parent.name
-        instance_name = parent_name.replace("_before_data", "") or before_path.stem
+        instance_name = before_path.stem.replace("_before_data", "")
+        # インスタンス名が空になるのを防ぐため、念のためチェック
+        if not instance_name:
+             instance_name = before_path.stem
         timestamp     = datetime.now().strftime("%Y%m%d_%H%M%S")
         save_dir      = Path(args.sp) / timestamp / f"{instance_name}_before_data"
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -301,18 +304,22 @@ class Core:
                 print(f"[swap {idx}] move={did_move} | qa={qa_ms:.1f}ms | total={block_ms:.1f}ms | "
                       f"before={sum_before:.3f} | after={sum_after:.3f}")
 
-            # 都市交換が発生しなかったら、このイテレーションでは TSP を解かず終了
-            if moved_total == 0:
-                print("🟡 No city moved in this iteration → stop optimization (skip TSP solving).")
-                break
-
-            # Save swap timings for this iteration (robust json)
+            # ---- ここから挙動変更部分 ----
+            # まず swap タイミングのログを保存（改善の有無に関わらず）
             swap_log_path = save_dir / f"iteration_{iteration}_swap_timings.json"
             with open(swap_log_path, "w") as f:
                 json.dump(swap_time_log, f, indent=2, default=to_native)
             print(f"🕒 Saved swap details: {swap_log_path}")
 
-            # 交換があったクラスタのみ TSP を解く（OR-Tools 既定）
+            # 都市交換が発生しなかった場合でも、このイテレーションで
+            # 一度 TSP を解いてから終了するようにする
+            if moved_total == 0:
+                print("🟡 No city moved in this iteration → solve final TSP over all clusters and stop.")
+                # 全クラスタを TSP の対象にする
+                touched_clusters = set(range(len(clusters)))
+            # ---- 変更ここまで ----
+
+            # 交換があったクラスタ（または収束時は全クラスタ）で TSP を解く
             total_distance = 0.0
             tsp_routes: List[Dict[str, Any]] = []
             if args.tsp_solver == "ortools":
@@ -327,14 +334,12 @@ class Core:
                         route = ort.get("route", [])
                         tot = ort.get("total_distance")
                         solver_status = ort.get("solver_status", "")
+                        solve_time_ms = ort.get("solve_time_ms", None)
                     else:
                         route = ort
                         tot = None
-
-                    route = ort.get("route", [])
-                    tot = ort.get("total_distance")
-                    solver_status = ort.get("solver_status", "")
-                    solve_time_ms = ort.get("solve_time_ms", None)
+                        solver_status = ""
+                        solve_time_ms = None
 
                     tsp_routes.append({
                         "cluster_id":     int(cluster_id),
@@ -344,7 +349,8 @@ class Core:
                         "solver_status":  solver_status,
                         "solve_time_ms":  solve_time_ms
                     })
-                    total_distance += tot
+                    if tot is not None:
+                        total_distance += tot
             else:
                 # 互換のために amplify(TSP) を選べるよう残す（必要なら）
                 from TSP import TSP
@@ -357,19 +363,25 @@ class Core:
                     tsp_solver = TSP(self.client, cluster_distance, cluster_demand, capacity,
                                      1, args.nt, city_list, str(save_dir), coordx, coordy, str(before_path))
                     result = tsp_solver.solve_TSP(args.p, args.q)
+                    dist_val = float(result.get("total_distances", 0.0))
                     tsp_routes.append({
                         "cluster_id":     int(cluster_id),
                         "route":          to_native(result.get("route")),
-                        "total_distance": float(result.get("total_distances", 0.0)),
+                        "total_distance": dist_val,
                         "solver":         "amplify",
                     })
-                    total_distance += float(result.get("total_distances", 0.0))
+                    total_distance += dist_val
 
             print(f"📏 Total distance (touched clusters only) after iteration {iteration}: {total_distance:.6f}")
             iteration_path = save_dir / f"iteration_{iteration}.json"
             with open(iteration_path, "w") as f:
                 json.dump(tsp_routes, f, indent=2, default=to_native)
             print(f"💾 Saved: {iteration_path}")
+
+            # 収束 or max_iter で終了
+            if moved_total == 0:
+                print("✅ No further moves → optimization finished.")
+                break
 
             if iteration >= args.max_iter:
                 print("⚠️ Reached max iterations. Stop.")

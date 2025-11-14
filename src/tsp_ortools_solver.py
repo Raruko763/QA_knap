@@ -20,7 +20,7 @@ def solve_tsp_ortools(distance_matrix, time_limit_ms=2000):
     search_params = pywrapcp.DefaultRoutingSearchParameters()
     search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     search_params.time_limit.seconds = time_limit_ms // 1000
-    search_params.time_limit.milliseconds = time_limit_ms % 1000
+    search_params.time_limit.FromMilliseconds(time_limit_ms)
 
     start_time = time.perf_counter()
     solution = routing.SolveWithParameters(search_params)
