@@ -24,6 +24,9 @@ echo "🔑 LKH_BIN   = ${LKH_BIN}"
 
 # ---------- インスタンス一覧 ----------
 INSTANCES=(
+#   "X-n856-k95"
+  "Leuven2"
+  "X-n1001-k43"
   "E-n101-k14"
   "E-n101-k8"
   "E-n76-k14"
@@ -31,9 +34,7 @@ INSTANCES=(
   "E-n76-k8"
   "E-n76-k7"
   "E-n51-k5"
-  "X-n856-k95"
-  "Leuven2"
-  "X-n1001-k43"
+
 )
 
 # ---------- 実行 ----------
@@ -56,7 +57,7 @@ for inst in "${INSTANCES[@]}"; do
     -nt 1 \
     --t 10000 \
     --tsp_solver lkh \
-    --tsp_time_limit_ms 50000
+    --tsp_time_limit_ms 3000
 
   echo "✅ 完了: ${inst}"
 done

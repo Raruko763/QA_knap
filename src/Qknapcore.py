@@ -22,15 +22,15 @@ import numpy as np
 # Make project root importable if running from scripts/
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+from src.tsp_lkh import solve_tsp_lkh
+from src.vrpfactory import vrpfactory
+from src.knap_divpro import knap_dippro
+from src.tsp_ortools import solve_tsp_ortools
+
 try:
     from amplify import FixstarsClient
 except Exception as e:
     raise RuntimeError("Failed to import 'amplify'. Install Fixstars Amplify SDK.") from e
-
-from src.vrpfactory import vrpfactory
-from src.knap_divpro import knap_dippro
-# from TSP import TSP  # ← QUBO版TSPは使わない
-from src.tsp_ortools import solve_tsp_ortools
 
 
 # ---------- utils ----------
@@ -100,17 +100,34 @@ class Core:
         ap.add_argument("--p",  help="QA parameter p",                       type=float, default=1.0)
         ap.add_argument("--q",  help="QA parameter q",                       type=float, default=1.0)
         ap.add_argument("--max_iter", help="Max iterations",                 type=int, default=50)
-        ap.add_argument("--tsp_solver", choices=["ortools", "amplify"], default="ortools",
-                        help="TSP solver: use 'ortools' to avoid QUBO")
-        ap.add_argument("--tsp_time_limit_ms", type=int, default=2000,
-                        help="OR-Tools time limit per cluster (ms)")
+        ap.add_argument(
+            "--tsp_solver",
+            choices=["ortools", "lkh", "amplify"],
+            default="ortools",
+            help="TSP solver: 'ortools', 'lkh', or 'amplify'"
+        )
+        ap.add_argument(
+            "--lkh_bin",
+            type=str,
+            default=None,
+            help="Path to LKH executable (default: env LKH_BIN or 'LKH')"
+        )
+        ap.add_argument(
+            "--tsp_time_limit_ms",
+            type=int,
+            default=2000,
+            help="Time limit per cluster TSP (ms) for OR-Tools / LKH"
+        )
         ap.add_argument("--eps", help="(unused, compat)",                    type=float, default=1e-3)
         args = ap.parse_args()
 
         # === Output dir ===
         before_path = Path(args.j).resolve()
-        parent_name = before_path.parent.name
-        instance_name = parent_name.replace("_before_data", "") or before_path.stem
+        # parent_name = before_path.parent.name
+        instance_name = before_path.stem.replace("_before_data", "")
+        # インスタンス名が空になるのを防ぐため、念のためチェック
+        if not instance_name:
+             instance_name = before_path.stem
         timestamp     = datetime.now().strftime("%Y%m%d_%H%M%S")
         save_dir      = Path(args.sp) / timestamp / f"{instance_name}_before_data"
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -256,7 +273,7 @@ class Core:
                 # Timing
                 t_block_end = time.perf_counter()
                 block_ms = float((t_block_end - t_block_start) * 1000.0)
-                qa_total_time = float(pro_result.get("total_time", 0.0))  # seconds expected
+                qa_total_time = float(pro_result.get("execution_time", 0.0))  # seconds expected
                 qa_ms = max(0.0, qa_total_time * 1000.0)
                 move_ms = max(0.0, block_ms - qa_ms)
                 n_city = int(pro_result.get("n_city", len(cur_ids)))
@@ -298,8 +315,10 @@ class Core:
                 }
                 swap_time_log.append(record)
 
-                print(f"[swap {idx}] move={did_move} | qa={qa_ms:.1f}ms | total={block_ms:.1f}ms | "
-                      f"before={sum_before:.3f} | after={sum_after:.3f}")
+                print(
+                    f"[swap {idx}] move={did_move} | qa={qa_ms:.1f}ms | total={block_ms:.1f}ms | "
+                    f"before={sum_before:.3f} | after={sum_after:.3f}"
+                )
 
             # 都市交換が発生しなかったら、このイテレーションでは TSP を解かず終了
             if moved_total == 0:
@@ -312,29 +331,29 @@ class Core:
                 json.dump(swap_time_log, f, indent=2, default=to_native)
             print(f"🕒 Saved swap details: {swap_log_path}")
 
-            # 交換があったクラスタのみ TSP を解く（OR-Tools 既定）
+            # === クラスタ内 TSP ===
             total_distance = 0.0
             tsp_routes: List[Dict[str, Any]] = []
+
             if args.tsp_solver == "ortools":
-                for cluster_id in sorted(touched_clusters):
+                # ★ 全クラスタを OR-Tools で解く
+                for cluster_id in range(len(clusters_coordx)):
                     coordx = [depo_x] + clusters_coordx[cluster_id]
                     coordy = [depo_y] + clusters_coordy[cluster_id]
                     cluster_distance = vrpfactory.make_cluster_distance_matrix(coordx, coordy)
 
                     ort = solve_tsp_ortools(cluster_distance, time_limit_ms=args.tsp_time_limit_ms)
-                    solver_status = ""
                     if isinstance(ort, dict):
                         route = ort.get("route", [])
                         tot = ort.get("total_distance")
                         solver_status = ort.get("solver_status", "")
+                        solve_time_ms = ort.get("solve_time_ms", None)
                     else:
+                        # 万が一 dict でない形式を返す実装だった場合の保険
                         route = ort
                         tot = None
-
-                    route = ort.get("route", [])
-                    tot = ort.get("total_distance")
-                    solver_status = ort.get("solver_status", "")
-                    solve_time_ms = ort.get("solve_time_ms", None)
+                        solver_status = ""
+                        solve_time_ms = None
 
                     tsp_routes.append({
                         "cluster_id":     int(cluster_id),
@@ -344,9 +363,75 @@ class Core:
                         "solver_status":  solver_status,
                         "solve_time_ms":  solve_time_ms
                     })
-                    total_distance += tot
+                    if tot is not None:
+                        total_distance += float(tot)
+
+            elif args.tsp_solver == "lkh":
+                # ★ 全クラスタを LKH + Amplify で解く（同じ距離行列）
+                from TSP import TSP  # すでに上で使ってるけど、ここでも使う
+
+                for cluster_id in range(len(clusters_coordx)):
+                    coordx = [depo_x] + clusters_coordx[cluster_id]
+                    coordy = [depo_y] + clusters_coordy[cluster_id]
+                    cluster_distance = vrpfactory.make_cluster_distance_matrix(coordx, coordy)
+
+                    # ---------- 1) LKH で解く ----------
+                    lkh_result = solve_tsp_lkh(
+                        dist_matrix=cluster_distance,
+                        work_dir=save_dir,
+                        time_limit_ms=args.tsp_time_limit_ms,
+                        runs=100,
+                        lkh_bin=args.lkh_bin,
+                    )
+
+                    lkh_route = lkh_result["route"]
+                    lkh_tot = float(lkh_result["total_distance"])
+
+                    # ---------- 2) Amplify で同じ距離行列を解く ----------
+                    #   TSP クラスが期待している形に合わせる（元の amplify 版と同じ）
+                    cluster_demand = [0] + cluster_demands[cluster_id]
+                    city_list      = [0] + clusters[cluster_id]
+
+                    tsp_solver = TSP(
+                        self.client,
+                        cluster_distance,
+                        cluster_demand,
+                        capacity,
+                        1,                 # nvehicle
+                        args.nt,           # num_solve
+                        city_list,
+                        str(save_dir),
+                        coordx,
+                        coordy,
+                        str(before_path),
+                    )
+
+                    amp_result = tsp_solver.solve_TSP(args.p, args.q)
+                    amp_route = amp_result.get("route")
+                    amp_tot   = float(amp_result.get("total_distances", 0.0))
+
+                    # ---------- 3) まとめてJSONに出す ----------
+                    tsp_routes.append({
+                        "cluster_id": int(cluster_id),
+
+                        # LKH 側
+                        "lkh_route":          lkh_route,
+                        "lkh_total_distance": lkh_tot,
+                        "lkh_solver":         "lkh",
+                        "lkh_status":         lkh_result.get("solver_status", ""),
+                        "lkh_solve_time_ms":  lkh_result.get("solve_time_ms", None),
+
+                        # Amplify 側
+                        "amplify_route":          amp_route,
+                        "amplify_total_distance": amp_tot,
+                        "amplify_solver":         "amplify",
+                    })
+
+                    # とりあえず LKH 側の距離を iteration の summary として足しておく
+                    total_distance += lkh_tot
+
             else:
-                # 互換のために amplify(TSP) を選べるよう残す（必要なら）
+                # ★ Amplify(TSP) を選択した場合（既存処理）
                 from TSP import TSP
                 for cluster_id in sorted(touched_clusters):
                     coordx = [depo_x] + clusters_coordx[cluster_id]
@@ -354,18 +439,23 @@ class Core:
                     cluster_demand = [0] + cluster_demands[cluster_id]
                     city_list = [0] + clusters[cluster_id]
                     cluster_distance = vrpfactory.make_cluster_distance_matrix(coordx, coordy)
-                    tsp_solver = TSP(self.client, cluster_distance, cluster_demand, capacity,
-                                     1, args.nt, city_list, str(save_dir), coordx, coordy, str(before_path))
+
+                    tsp_solver = TSP(
+                        self.client, cluster_distance, cluster_demand, capacity,
+                        1, args.nt, city_list, str(save_dir), coordx, coordy, str(before_path)
+                    )
                     result = tsp_solver.solve_TSP(args.p, args.q)
+                    tot = float(result.get("total_distances", 0.0))
+
                     tsp_routes.append({
                         "cluster_id":     int(cluster_id),
                         "route":          to_native(result.get("route")),
-                        "total_distance": float(result.get("total_distances", 0.0)),
+                        "total_distance": tot,
                         "solver":         "amplify",
                     })
-                    total_distance += float(result.get("total_distances", 0.0))
+                    total_distance += tot
 
-            print(f"📏 Total distance (touched clusters only) after iteration {iteration}: {total_distance:.6f}")
+            print(f"📏 Total distance after iteration {iteration}: {total_distance:.6f}")
             iteration_path = save_dir / f"iteration_{iteration}.json"
             with open(iteration_path, "w") as f:
                 json.dump(tsp_routes, f, indent=2, default=to_native)
@@ -375,6 +465,99 @@ class Core:
                 print("⚠️ Reached max iterations. Stop.")
                 break
 
+        print("\n🔚 Final TSP on all clusters for reporting")
+        final_total_distance = 0.0
+        final_routes: List[Dict[str, Any]] = []
+
+        if args.tsp_solver == "ortools":
+            for cluster_id in range(len(clusters_coordx)):
+                coordx = [depo_x] + clusters_coordx[cluster_id]
+                coordy = [depo_y] + clusters_coordy[cluster_id]
+                cluster_distance = vrpfactory.make_cluster_distance_matrix(coordx, coordy)
+
+                ort = solve_tsp_ortools(cluster_distance, time_limit_ms=args.tsp_time_limit_ms)
+                if isinstance(ort, dict):
+                    route = ort.get("route", [])
+                    tot = ort.get("total_distance")
+                    solver_status = ort.get("solver_status", "")
+                    solve_time_ms = ort.get("solve_time_ms", None)
+                else:
+                    route = ort
+                    tot = None
+                    solver_status = ""
+                    solve_time_ms = None
+
+                final_routes.append({
+                    "cluster_id":     int(cluster_id),
+                    "route":          route,
+                    "total_distance": tot,
+                    "solver":         "ortools",
+                    "solver_status":  solver_status,
+                    "solve_time_ms":  solve_time_ms
+                })
+                if tot is not None:
+                    final_total_distance += float(tot)
+
+        elif args.tsp_solver == "lkh":
+            for cluster_id in range(len(clusters_coordx)):
+                coordx = [depo_x] + clusters_coordx[cluster_id]
+                coordy = [depo_y] + clusters_coordy[cluster_id]
+                cluster_distance = vrpfactory.make_cluster_distance_matrix(coordx, coordy)
+
+                lkh_result = solve_tsp_lkh(
+                    dist_matrix=cluster_distance,
+                    work_dir=save_dir,
+                    time_limit_ms=args.tsp_time_limit_ms,
+                    runs=100,
+                    seed=12345,
+                    lkh_bin=args.lkh_bin,
+                )
+
+                route = lkh_result["route"]
+                tot = float(lkh_result["total_distance"])
+
+                final_routes.append({
+                    "cluster_id":     int(cluster_id),
+                    "route":          route,
+                    "total_distance": tot,
+                    "solver":         "lkh",
+                    "solver_status":  lkh_result.get("solver_status", ""),
+                    "solve_time_ms":  lkh_result.get("solve_time_ms", None),
+                })
+                final_total_distance += tot
+
+        else:
+            from TSP import TSP
+            for cluster_id in range(len(clusters_coordx)):
+                coordx = [depo_x] + clusters_coordx[cluster_id]
+                coordy = [depo_y] + clusters_coordy[cluster_id]
+                cluster_demand = [0] + cluster_demands[cluster_id]
+                city_list = [0] + clusters[cluster_id]
+                cluster_distance = vrpfactory.make_cluster_distance_matrix(coordx, coordy)
+
+                tsp_solver = TSP(
+                    self.client, cluster_distance, cluster_demand, capacity,
+                    1, args.nt, city_list, str(save_dir), coordx, coordy, str(before_path)
+                )
+                result = tsp_solver.solve_TSP(args.p, args.q)
+                tot = float(result.get("total_distances", 0.0))
+
+                final_routes.append({
+                    "cluster_id":     int(cluster_id),
+                    "route":          to_native(result.get("route")),
+                    "total_distance": tot,
+                    "solver":         "amplify",
+                })
+                final_total_distance += tot
+
+        final_path = save_dir / "final_routes.json"
+        with open(final_path, "w") as f:
+            json.dump(final_routes, f, indent=2, default=to_native)
+
+        print(f"📏 Final total distance: {final_total_distance:.6f}")
+        print(f"💾 Saved final routes: {final_path}")
+
+       
         print("\n✅ Optimization completed.")
         print(f"📂 Results saved in: {save_dir}")
 
