@@ -7,18 +7,13 @@ from shutil import which
 import numpy as np
 
 
-def solve_tsp_lkh(dist_matrix, work_dir, time_limit_ms=2000,
+def solve_tsp_lkh(dist_matrix, work_dir, time_limit_ms=3000,
                   runs=20, seed=12345, lkh_bin=None):
     """
     LKH を使って TSP を解く（距離行列 → EXPLICIT TSPLIB → LKH実行）
 
-    LKHの整数距離制約に合わせて距離行列を整数化しますが、
-    LKHが見つけた経路の最終的な合計距離は、元のFloat距離行列を用いて
-    正確に再評価します。（評価誤差排除のための修正）
-
-    dist_matrix: NxN の距離行列（depot含む, float/int/np.ndarray）
+    dist_matrix: NxN の距離行列（depot含む）
     work_dir   : 出力フォルダ（Path or str）
-    runs       : LKHの実行回数 (デフォルト値を20に設定)
     """
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -31,21 +26,17 @@ def solve_tsp_lkh(dist_matrix, work_dir, time_limit_ms=2000,
             "PATH を通すか、環境変数 LKH_BIN を設定してください。"
         )
 
-    # ---- 距離行列の準備 ----
-    # Float行列 D を評価用に保持 (元の精度を保つ)
+    # ---- 距離行列を整数化（LKHは整数前提） ----
     D = np.asarray(dist_matrix, dtype=float)
     n = int(D.shape[0])
-
-    # ---- ノード数チェック ----
-    MAX_NODES = 200
-    if n > MAX_NODES:
-        raise ValueError(
-            f"ノード数 ({n}) が許容される最大値 ({MAX_NODES}) を超えています。\n"
-            "200都市を超えるTSP問題の解決は許可されていません。"
-        )
+    # ---- ノード数チェックの追加 ----
+    # MAX_NODES = 200
+    # if n > MAX_NODES:
+    #     raise ValueError(
+    #         f"ノード数 ({n}) が許容される最大値 ({MAX_NODES}) を超えています。\n"
+    #         "200都市を超えるTSP問題の解決は許可されていません。"
+    #     )
     # --------------------------------
-
-    # LKH用: 整数化距離行列 D_int を作成 (四捨五入)
     D_int = np.rint(D).astype(int)
     np.fill_diagonal(D_int, 0)
 
@@ -55,7 +46,7 @@ def solve_tsp_lkh(dist_matrix, work_dir, time_limit_ms=2000,
     par_path = work_dir / f"cluster_{uniq}.par"
     tour_path = work_dir / f"cluster_{uniq}.tour"
 
-    # ---- TSPLIB 問題ファイル (整数距離 D_int を書き出す) ----
+    # ---- TSPLIB 問題ファイル ----
     with open(tsp_path, "w") as f:
         f.write(f"NAME: cluster_{uniq}\n")
         f.write("TYPE: TSP\n")
@@ -67,13 +58,13 @@ def solve_tsp_lkh(dist_matrix, work_dir, time_limit_ms=2000,
             f.write(" ".join(str(int(v)) for v in D_int[i]) + "\n")
         f.write("EOF\n")
 
-    # ---- パラメータファイル (RUNSを20に変更) ----
+    # ---- パラメータファイル ----
     time_limit_sec = max(1, int(round(time_limit_ms / 1000.0)))
     with open(par_path, "w") as f:
         f.write(f"PROBLEM_FILE = {tsp_path.name}\n")
         f.write(f"OUTPUT_TOUR_FILE = {tour_path.name}\n")
-        f.write(f"RUNS = {int(runs)}\n")  # ★ RUNS=20 を適用
-        f.write(f"TIME_LIMIT = {time_limit_sec}\n")  # 秒
+        f.write(f"RUNS = {int(runs)}\n")
+        f.write(f"TIME_LIMIT = {time_limit_sec}\n")    # 秒
         f.write(f"SEED = {int(seed)}\n")
         f.write("TRACE_LEVEL = 0\n")
 
@@ -121,29 +112,16 @@ def solve_tsp_lkh(dist_matrix, work_dir, time_limit_ms=2000,
         missing = [i for i in range(n) if i not in route_idx]
         route_idx += missing
 
-    # ---- 合計距離計算（オリジナルの浮動小数点距離行列 D で） ----
-    # LKHが見つけた経路を、元のFloat距離行列 D で再評価し、評価誤差を排除する
-    total_float = 0.0
+    # ---- 合計距離計算（渡した距離行列で） ----
+    total = 0
     for i in range(n):
         a = route_idx[i]
         b = route_idx[(i + 1) % n]
-        total_float += D[a][b] # D はオリジナルの float 行列
-
-    # LKHが報告したTotal Distance (整数化された距離での合計) も取得しておく
-    # LKHのstdoutから最後の"Cost.min"や"Best"の値をパースするのが理想だが、
-    # 簡単のため、LKHが最適化したD_intでの合計値も計算しておく
-    lkh_reported_total_int = 0
-    for i in range(n):
-        a = route_idx[i]
-        b = route_idx[(i + 1) % n]
-        lkh_reported_total_int += int(D_int[a][b])
-
+        total += int(D_int[a][b])
 
     return {
         "route": route_idx,
-        "total_distance": int(np.floor(total_float)), # Float値を切り捨てて整数で返す (メインロジック互換)
-        "total_distance_float": float(total_float), # 正確な Float 値
-        "lkh_internal_distance": int(lkh_reported_total_int), # LKHが認識した整数距離の合計
+        "total_distance": int(total),
         "solver": "lkh",
         "solver_status": "SUCCESS",
         "solve_time_ms": solve_ms,
