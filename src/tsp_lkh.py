@@ -94,7 +94,7 @@ def solve_tsp_lkh(
             # 候補リストの作成方法を距離だけでなく角度も考慮する方式に変更してみる
             f.write("CANDIDATE_SET_TYPE = ALPHA\n")
             
-        f.write("TRACE_LEVEL = 0\n")
+        f.write("TRACE_LEVEL = 2\n")
 
     # ---- LKH 実行 ----
     t0 = time.perf_counter()
