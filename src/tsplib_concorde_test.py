@@ -1,12 +1,13 @@
-# tsplib_concorde_test.py
 import sys
 import math
 import time
 import subprocess
+import argparse
+import csv
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 
-
+# --- (1) 既存の read_tsplib 関数 ---
 def read_tsplib(tsp_path: Path) -> Dict:
     name = None
     dim = None
@@ -14,6 +15,10 @@ def read_tsplib(tsp_path: Path) -> Dict:
     edge_weight_format = None
     coords: List[Tuple[float, float]] = []
     dist_matrix: Optional[List[List[int]]] = None
+
+    # [Errno 21] Is a directory: のエラーを回避するため、ファイルであるか確認
+    if not tsp_path.is_file():
+        raise FileNotFoundError(f"ファイルが見つからないか、ディレクトリです: {tsp_path}")
 
     lines = tsp_path.read_text().splitlines()
 
@@ -48,13 +53,14 @@ def read_tsplib(tsp_path: Path) -> Dict:
             if u == "NODE_COORD_SECTION":
                 reading = True
                 continue
-            if u == "EOF":
+            if u == "EOF" or u == "DEMAND_SECTION" or u == "CAPACITY":
                 break
             if ":" in s and not reading:
                 continue
             if reading:
                 parts = s.split()
-                if len(parts) >= 3:
+                # ノードID、X座標、Y座標の3要素を期待
+                if len(parts) >= 3 and parts[0].isdigit():
                     x = float(parts[1])
                     y = float(parts[2])
                     coords.append((x, y))
@@ -95,13 +101,14 @@ def read_tsplib(tsp_path: Path) -> Dict:
         "dist_matrix": dist_matrix,
     }
 
-
+# --- (2) 既存の calc_tour_cost 関数 ---
 def calc_tour_cost(info: Dict, tour_zero_based: List[int]) -> float:
     dim = info["dim"]
     if len(tour_zero_based) == dim + 1 and tour_zero_based[0] == tour_zero_based[-1]:
         tour_zero_based = tour_zero_based[:-1]
 
     if len(tour_zero_based) != dim:
+        # 見つからない都市を埋める（Concordeの結果が不完全な場合）
         seen = set(tour_zero_based)
         missing = [i for i in range(dim) if i not in seen]
         tour_zero_based = tour_zero_based + missing
@@ -119,7 +126,8 @@ def calc_tour_cost(info: Dict, tour_zero_based: List[int]) -> float:
             b = tour_zero_based[(i + 1) % dim]
             x1, y1 = coords[a]
             x2, y2 = coords[b]
-            total += math.hypot(x1 - x2, y1 - y2)
+            # 距離を整数に丸めない (TSPLIBでは通常、四捨五入して整数距離を扱うが、ここでは浮動小数点で計算)
+            total += math.hypot(x1 - x2, y1 - y2) 
     elif etype == "EXPLICIT":
         if dist_matrix is None:
             raise ValueError("dist_matrix が必要です (EXPLICIT)")
@@ -132,13 +140,16 @@ def calc_tour_cost(info: Dict, tour_zero_based: List[int]) -> float:
 
     return total
 
-
-def solve_tsplib_with_concorde(tsp_file: str, workdir: str = "."):
+# --- (3) 既存の solve_tsplib_with_concorde 関数 ---
+def solve_tsplib_with_concorde(tsp_file: str, workdir: str = "concorde_tsplib_test") -> Dict[str, Any]:
     tsp_path = Path(tsp_file).resolve()
     workdir_path = Path(workdir).resolve()
     workdir_path.mkdir(parents=True, exist_ok=True)
 
     local_tsp = workdir_path / tsp_path.name
+    
+    # ファイルを作業ディレクトリにコピー
+    # 以前のエラー（IsADirectoryError）を回避するため、tsp_pathがファイルであることを前提とする
     if local_tsp != tsp_path:
         local_tsp.write_bytes(tsp_path.read_bytes())
 
@@ -191,11 +202,13 @@ def solve_tsplib_with_concorde(tsp_file: str, workdir: str = "."):
         if s in ("-1", "EOF"):
             break
         try:
+            # 1-based index を 0-based index に変換
             tour_idx.append(int(s) - 1)
         except ValueError:
             pass
 
-    info = read_tsplib(local_tsp)
+    # 注: read_tsplibの呼び出しを local_tsp に変更
+    info = read_tsplib(local_tsp) 
     cost = calc_tour_cost(info, tour_idx)
 
     return {
@@ -207,21 +220,105 @@ def solve_tsplib_with_concorde(tsp_file: str, workdir: str = "."):
     }
 
 
+# --- (4) 拡張された main 関数 ---
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python tsplib_concorde_test.py path/to/instance.tsp [...]")
-        sys.exit(0)
+    ap = argparse.ArgumentParser(
+        description="指定されたディレクトリ内のTSPLIBファイルをConcordeで解き、結果をCSVに出力します。"
+    )
+    ap.add_argument("path", help="処理対象のファイル、またはディレクトリパス", type=str)
+    ap.add_argument(
+        "--max_dim", 
+        help="処理する都市数(DIMENSION)の最大上限 (この値以下の問題のみ処理)", 
+        type=int, 
+        default=sys.maxsize
+    )
+    ap.add_argument(
+        "--output",
+        help="結果を保存するCSVファイル名",
+        type=str,
+        default="concorde_results.csv",
+    )
+    args = ap.parse_args()
+    
+    target_path = Path(args.path).resolve()
+    max_dim = args.max_dim
+    
+    # 処理対象のファイルリストを決定
+    tsp_files = []
+    if target_path.is_dir():
+        # ディレクトリ内のすべての .tsp ファイルを再帰的に検索
+        print(f"📂 ディレクトリ '{target_path.name}' 内の .tsp ファイルを検索中...")
+        tsp_files.extend(target_path.rglob("*.tsp"))
+    elif target_path.is_file():
+        # 単一のファイルの場合
+        tsp_files.append(target_path)
+    else:
+        print(f"❌ パスが見つからないか、無効です: {args.path}")
+        return
 
-    for arg in sys.argv[1:]:
-        res = solve_tsplib_with_concorde(arg, workdir="concorde_tsplib_test")
-        print(f"Instance: {Path(arg).stem}")
-        print(f"  ok      : {res['ok']}")
-        print(f"  elapsed : {res['elapsed']:.3f} sec")
-        print(f"  tour    : {res['tour_file']}")
-        print(f"  cost    : {res['cost']}")
-        print(f"  msg     : {res['msg']}")
-        print()
+    # 結果を保持するリスト
+    results_list: List[Dict[str, Any]] = []
+    
+    print(f"🔍 処理対象のファイル数: {len(tsp_files)}")
+    if max_dim != sys.maxsize:
+        print(f"📏 都市数上限: {max_dim} を超えるファイルはスキップされます。")
 
+    # ファイルを一つずつ処理
+    for tsp_file_path in tsp_files:
+        print(f"\n--- 処理中: {tsp_file_path.name} ---")
+        
+        try:
+            # 都市数(DIMENSION)を読み込み、フィルタリング
+            info = read_tsplib(tsp_file_path)
+            dim = info['dim']
+            
+            if dim > max_dim:
+                print(f"⏭️ スキップ (都市数 {dim} > 上限 {max_dim})")
+                continue
+                
+            print(f"✅ 都市数: {dim} / EDGE_WEIGHT_TYPE: {info['edge_weight_type']}")
+
+            # Concordeで解く
+            res = solve_tsplib_with_concorde(str(tsp_file_path))
+            
+            result = {
+                "Instance": tsp_file_path.name,
+                "DIMENSION": dim,
+                "Status": "SUCCESS" if res['ok'] else "FAILED",
+                "Cost": f"{res['cost']:.4f}" if res['cost'] is not None else "N/A",
+                "Time_sec": f"{res['elapsed']:.3f}",
+                "Message": res['msg'].strip() if res['msg'] else "",
+            }
+            results_list.append(result)
+            
+            print(f"    結果: {result['Status']}, コスト: {result['Cost']}, 時間: {result['Time_sec']} sec")
+
+        except Exception as e:
+            # 処理失敗時のログ
+            print(f"❌ 処理中にエラーが発生しました: {type(e).__name__}: {e}")
+            results_list.append({
+                "Instance": tsp_file_path.name,
+                "DIMENSION": "N/A",
+                "Status": "ERROR",
+                "Cost": "N/A",
+                "Time_sec": "N/A",
+                "Message": str(e),
+            })
+            continue
+
+    # --- CSVへの書き出し ---
+    if results_list:
+        csv_path = Path(args.output).resolve()
+        fieldnames = ["Instance", "DIMENSION", "Status", "Cost", "Time_sec", "Message"]
+        
+        with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(results_list)
+        
+        print(f"\n🎉 処理完了。結果は '{csv_path.name}' に保存されました。")
+    else:
+        print("\n⚠️ 処理されたファイルはありませんでした。")
 
 if __name__ == "__main__":
     main()
