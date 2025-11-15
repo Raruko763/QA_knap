@@ -1,0 +1,1 @@
+from tsplib_lkh_test import parse_best_cost_from_log

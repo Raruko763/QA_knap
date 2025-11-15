@@ -17,8 +17,8 @@ INSTANCES=(
   "X-n856-k95"
   "Leuven2"
   "E-n51-k5"
-  "E-n101-k14"
-  "X-n1001-k43"
+  # "E-n101-k14"
+  # "X-n1001-k43"
 )
 OUT_DIR="./out"
 

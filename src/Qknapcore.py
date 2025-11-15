@@ -304,26 +304,18 @@ class Core:
                 print(f"[swap {idx}] move={did_move} | qa={qa_ms:.1f}ms | total={block_ms:.1f}ms | "
                       f"before={sum_before:.3f} | after={sum_after:.3f}")
 
-            # ---- ここから挙動変更部分 ----
-            # まず swap タイミングのログを保存（改善の有無に関わらず）
-            swap_log_path = save_dir / f"iteration_{iteration}_swap_timings.json"
-            with open(swap_log_path, "w") as f:
-                json.dump(swap_time_log, f, indent=2, default=to_native)
-            print(f"🕒 Saved swap details: {swap_log_path}")
+            # ---- ここから挙動変更部分 (常に全クラスタのTSPを解く) ----
+            # 都市交換の有無に関わらず、このイテレーションでは常に全てのクラスタでTSPを解く
+            all_clusters = set(range(len(clusters)))
+            target_clusters = all_clusters # ★ 常に全クラスタを対象とする
+            
+            print(f"🔄 Solving TSP for ALL {len(target_clusters)} clusters in iteration {iteration}.")
 
-            # 都市交換が発生しなかった場合でも、このイテレーションで
-            # 一度 TSP を解いてから終了するようにする
-            if moved_total == 0:
-                print("🟡 No city moved in this iteration → solve final TSP over all clusters and stop.")
-                # 全クラスタを TSP の対象にする
-                touched_clusters = set(range(len(clusters)))
-            # ---- 変更ここまで ----
-
-            # 交換があったクラスタ（または収束時は全クラスタ）で TSP を解く
+            # 交換があったクラスタ「以外」のクラスタ（または収束時は全クラスタ）で TSP を解く
             total_distance = 0.0
             tsp_routes: List[Dict[str, Any]] = []
             if args.tsp_solver == "ortools":
-                for cluster_id in sorted(touched_clusters):
+                for cluster_id in sorted(target_clusters):
                     coordx = [depo_x] + clusters_coordx[cluster_id]
                     coordy = [depo_y] + clusters_coordy[cluster_id]
                     cluster_distance = vrpfactory.make_cluster_distance_matrix(coordx, coordy)
@@ -354,7 +346,7 @@ class Core:
             else:
                 # 互換のために amplify(TSP) を選べるよう残す（必要なら）
                 from TSP import TSP
-                for cluster_id in sorted(touched_clusters):
+                for cluster_id in sorted(target_clusters):
                     coordx = [depo_x] + clusters_coordx[cluster_id]
                     coordy = [depo_y] + clusters_coordy[cluster_id]
                     cluster_demand = [0] + cluster_demands[cluster_id]
@@ -372,7 +364,7 @@ class Core:
                     })
                     total_distance += dist_val
 
-            print(f"📏 Total distance (touched clusters only) after iteration {iteration}: {total_distance:.6f}")
+            print(f"📏 Total distance (ALL clusters) after iteration {iteration}: {total_distance:.6f}")
             iteration_path = save_dir / f"iteration_{iteration}.json"
             with open(iteration_path, "w") as f:
                 json.dump(tsp_routes, f, indent=2, default=to_native)
@@ -386,6 +378,7 @@ class Core:
             if iteration >= args.max_iter:
                 print("⚠️ Reached max iterations. Stop.")
                 break
+
 
         print("\n✅ Optimization completed.")
         print(f"📂 Results saved in: {save_dir}")
