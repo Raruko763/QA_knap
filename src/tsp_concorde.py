@@ -1,5 +1,6 @@
 # src/tsp_concorde.py
 import os
+import re
 import time
 import subprocess
 from pathlib import Path
@@ -51,31 +52,10 @@ def solve_tsp_concorde(
     距離行列を TSPLIB (FULL_MATRIX) に変換して Concorde を 1 回実行し、
     経路と総距離などを返す。
 
-    Parameters
-    ----------
-    dist_matrix : array-like (N, N)
-        対称 or 非対称でもよいが、ここでは行列の値をそのまま距離として使う。
-    work_dir : str | Path
-        一時ファイル(.tsp, .sol/.tour)を置く作業ディレクトリ。
-    seed : int | None
-        Concorde の -s オプションに渡す乱数シード。None の場合は指定しない。
-    concorde_bin : str | None
-        Concorde 実行ファイルのパス。None の場合は PATH / CONCORDE_BIN から解決。
-
-    Returns
-    -------
-    result : dict
-        {
-            "route": List[int],        # 0-based 巡回順
-            "total_distance": int,     # D_int に基づく総距離
-            "solver": "concorde",
-            "solver_status": "SUCCESS" or "FAIL",
-            "solve_time_ms": int,      # 実測実行時間(ms)
-            "raw_stdout": str,
-            "raw_stderr": str,
-            "tsp_file": str,
-            "tour_file": str | None,
-        }
+    ※ ルート補完は一切しない。
+      - route 長さ != n
+      - 0..n-1 の置換になっていない
+      いずれかなら FAIL 扱いにして route=None を返す。
     """
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -92,10 +72,11 @@ def solve_tsp_concorde(
     # ---- 一意なファイル名 ----
     uniq = f"{int(time.time() * 1000)}_{os.getpid()}"
     tsp_path = work_dir / f"cluster_{uniq}.tsp"
+    stem = tsp_path.stem  # ★ ここで stem を定義するのがポイント
 
     # ---- TSPLIB FULL_MATRIX 問題ファイル作成 ----
     with tsp_path.open("w") as f:
-        f.write(f"NAME: cluster_{uniq}\n")
+        f.write(f"NAME: {stem}\n")
         f.write("TYPE: TSP\n")
         f.write(f"DIMENSION: {n}\n")
         f.write("EDGE_WEIGHT_TYPE: EXPLICIT\n")
@@ -108,9 +89,10 @@ def solve_tsp_concorde(
 
     concorde_exec = _resolve_concorde_bin(concorde_bin)
 
+    # ★ TOUR_SECTION 形式の .tour を強制生成 (-x で .mas/.sav も消す)
     cmd = [concorde_exec, tsp_path.name]
     if seed is not None:
-        cmd += ["-s", str(int(seed))]
+       cmd += ["-s", str(int(seed))]
 
     t0 = time.perf_counter()
     proc = subprocess.run(
@@ -123,10 +105,18 @@ def solve_tsp_concorde(
     t1 = time.perf_counter()
     solve_ms = int((t1 - t0) * 1000)
 
-    # ---- tour ファイル探索 (.sol / .tour のどちらか) ----
-    stem = tsp_path.stem
+    # ---- stdout から最適値を拾う（距離チェック用）----
+    optimal_value_stdout = None
+    m = re.search(r"Optimal Solution:\s*([0-9.+\-Ee]+)", proc.stdout)
+    if m:
+        try:
+            optimal_value_stdout = float(m.group(1))
+        except ValueError:
+            optimal_value_stdout = None
+
+    # ---- tour ファイル探索 (.tour を優先) ----
     tour_path = None
-    for ext in (".sol", ".tour"):
+    for ext in (".tour", ".sol"):
         cand = work_dir / f"{stem}{ext}"
         if cand.exists():
             tour_path = cand
@@ -138,16 +128,22 @@ def solve_tsp_concorde(
             "route": None,
             "total_distance": None,
             "solver": "concorde",
-            "solver_status": "FAIL",
+            "solver_status": "FAIL_RUN_OR_NO_TOUR",
             "solve_time_ms": solve_ms,
             "raw_stdout": proc.stdout,
             "raw_stderr": proc.stderr,
             "tsp_file": str(tsp_path),
             "tour_file": str(tour_path) if tour_path else None,
+            "optimal_value_stdout": optimal_value_stdout,
+            "cost": None,
         }
 
-    # ---- TOUR_SECTION 読み取り ----
+    # ==============================
+    #   TOUR の読み取り（補完なし）
+    # ==============================
     route_idx: list[int] = []
+
+    # ---- ① TSPLIB TOUR_SECTION 形式を優先 ----
     with tour_path.open("r") as f:
         reading = False
         for line in f:
@@ -159,38 +155,141 @@ def solve_tsp_concorde(
                 continue
             if s in ("-1", "EOF"):
                 break
-            try:
-                node = int(s)
-            except ValueError:
-                continue
-            # TSPLIB は 1-based なので 0-based に変換
-            route_idx.append(node - 1)
+            # 一行に複数数字がある場合にも対応
+            for tok in s.split():
+                try:
+                    node = int(tok)
+                except ValueError:
+                    continue
+                # TSPLIB は 1-based
+                route_idx.append(node - 1)
 
-    # ---- 長さ補正（LKH ラッパと同じノリで安全側に補完）----
-    if len(route_idx) > n:
-        route_idx = route_idx[:n]
+    # ---- ② フォールバック: TOUR_SECTION が無い場合、正の整数全部を読む ----
+    if not route_idx:
+        tokens: list[int] = []
+        with tour_path.open("r") as f:
+            for line in f:
+                for tok in line.strip().split():
+                    try:
+                        node = int(tok)
+                    except ValueError:
+                        continue
+                    tokens.append(node)
 
-    if len(route_idx) < n:
-        seen = set(route_idx)
-        missing = [i for i in range(n) if i not in seen]
-        route_idx.extend(missing)
+        if not tokens:
+            return {
+                "route": None,
+                "total_distance": None,
+                "solver": "concorde",
+                "solver_status": "FAIL_PARSE_TOUR_EMPTY",
+                "solve_time_ms": solve_ms,
+                "raw_stdout": proc.stdout,
+                "raw_stderr": proc.stderr,
+                "tsp_file": str(tsp_path),
+                "tour_file": str(tour_path),
+                "optimal_value_stdout": optimal_value_stdout,
+                "cost": None,
+            }
 
-    # 念のため 0..n-1 の置換にしておく
+        # パターンB想定:
+        #   [n, v0, v1, ..., v{n-1}]  (0-based)
+        #   もしくは [v0, ..., v{n-1}] (0-based / 1-based)
+        if tokens[0] == n and len(tokens) == n + 1:
+            cand = tokens[1:]
+        elif len(tokens) == n:
+            cand = tokens[:]
+        else:
+            return {
+                "route": None,
+                "total_distance": None,
+                "solver": "concorde",
+                "solver_status": "FAIL_PARSE_TOUR_LEN_MISMATCH",
+                "solve_time_ms": solve_ms,
+                "raw_stdout": proc.stdout,
+                "raw_stderr": proc.stderr,
+                "tsp_file": str(tsp_path),
+                "tour_file": str(tour_path),
+                "optimal_value_stdout": optimal_value_stdout,
+                "cost": None,
+            }
+
+        # 0-based / 1-based 判定
+        mn, mx = min(cand), max(cand)
+        if mn == 0 and mx == n - 1:
+            route_idx = cand
+        elif mn == 1 and mx == n:
+            route_idx = [x - 1 for x in cand]
+        else:
+            return {
+                "route": None,
+                "total_distance": None,
+                "solver": "concorde",
+                "solver_status": "FAIL_PARSE_TOUR_RANGE",
+                "solve_time_ms": solve_ms,
+                "raw_stdout": proc.stdout,
+                "raw_stderr": proc.stderr,
+                "tsp_file": str(tsp_path),
+                "tour_file": str(tour_path),
+                "optimal_value_stdout": optimal_value_stdout,
+                "cost": None,
+            }
+
+    # ---- ③ 厳密チェック（補完なし）----
     if len(route_idx) != n:
-        raise RuntimeError(
-            f"Concorde の tour 長がおかしいです: len(route_idx)={len(route_idx)}, n={n}"
-        )
+        return {
+            "route": None,
+            "total_distance": None,
+            "solver": "concorde",
+            "solver_status": "FAIL_TOUR_LEN",
+            "solve_time_ms": solve_ms,
+            "raw_stdout": proc.stdout,
+            "raw_stderr": proc.stderr,
+            "tsp_file": str(tsp_path),
+            "tour_file": str(tour_path),
+            "optimal_value_stdout": optimal_value_stdout,
+            "cost": None,
+        }
+
+    if set(route_idx) != set(range(n)):
+        return {
+            "route": None,
+            "total_distance": None,
+            "solver": "concorde",
+            "solver_status": "FAIL_TOUR_PERM",
+            "solve_time_ms": solve_ms,
+            "raw_stdout": proc.stdout,
+            "raw_stderr": proc.stderr,
+            "tsp_file": str(tsp_path),
+            "tour_file": str(tour_path),
+            "optimal_value_stdout": optimal_value_stdout,
+            "cost": None,
+        }
 
     # ---- 総距離計算 ----
+        # ---- 総距離計算（ルートからのコスト）----
     total = 0
     for i in range(n):
         a = route_idx[i]
         b = route_idx[(i + 1) % n]
         total += int(D_int[a, b])
 
+    cost_from_route = int(total)
+
+    # ---- Concorde 表示値との比較用 ----
+    cost_from_stdout = None
+    if optimal_value_stdout is not None:
+        # TSPLIB 用の整数距離になっているはずなので丸めておく
+        cost_from_stdout = int(round(optimal_value_stdout))
+
+    cost_diff = None
+    if cost_from_stdout is not None:
+        cost_diff = cost_from_route - cost_from_stdout
+
+    # メインで返す cost は「自前の距離行列に対するコスト」でそろえる
+    # （クラスタ内距離など、こっち側の定義が真実だから）
     return {
         "route": route_idx,
-        "total_distance": int(total),
+        "total_distance": cost_from_route,          # = route から計算した値
         "solver": "concorde",
         "solver_status": "SUCCESS",
         "solve_time_ms": solve_ms,
@@ -198,4 +297,13 @@ def solve_tsp_concorde(
         "raw_stderr": proc.stderr,
         "tsp_file": str(tsp_path),
         "tour_file": str(tour_path),
+
+        # 両方残しておく
+        "optimal_value_stdout": optimal_value_stdout,  # 生の float
+        "cost_from_stdout": cost_from_stdout,          # int に丸めたもの
+        "cost_from_route": cost_from_route,
+        "cost_diff": cost_diff,                        # route - stdout
+
+        # 互換用エイリアス（今まで通り cost を見るコード向け）
+        "cost": cost_from_route,
     }

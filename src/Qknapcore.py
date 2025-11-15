@@ -2,10 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 Core experiment driver (hardened serialization + correct logging):
+
 - Always convert NumPy types to native Python for JSON.
 - Use latest cluster state (clusters / cluster_demands / centroids) consistently.
 - "after" is recomputed from state; if no move occurred, it naturally equals "before" without explicit assignment.
-- Skip writing iteration files only if *really* desired; here we DO write when there were moves.
+- 毎イテレーションで「全クラスタ」のTSPを解く。
+- iteration_x.json にはクラスタ内ローカルインデックスに加えて
+  グローバル都市インデックスのルートも保存する。
+- swap のタイミングログも iteration_x_swap_timings.json に保存する。
 """
 
 import os
@@ -29,7 +33,6 @@ except Exception as e:
 
 from src.vrpfactory import vrpfactory
 from src.knap_divpro import knap_dippro
-# from TSP import TSP  # ← QUBO版TSPは使わない
 from src.tsp_ortools import solve_tsp_ortools
 
 
@@ -111,9 +114,9 @@ class Core:
         before_path = Path(args.j).resolve()
         parent_name = before_path.parent.name
         instance_name = before_path.stem.replace("_before_data", "")
-        # インスタンス名が空になるのを防ぐため、念のためチェック
+        # インスタンス名が空になるのを防ぐ
         if not instance_name:
-             instance_name = before_path.stem
+            instance_name = before_path.stem
         timestamp     = datetime.now().strftime("%Y%m%d_%H%M%S")
         save_dir      = Path(args.sp) / timestamp / f"{instance_name}_before_data"
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -136,8 +139,7 @@ class Core:
         self.client.parameters.timeout = timedelta(milliseconds=args.t)
 
         # === Initial centroid-level TSP (cluster order) ===
-        # 既存の「重心TSP」部分は変更せずAmplify版を利用
-        from TSP import TSP
+        from TSP import TSP  # ここは既存の QUBO TSP（重心順序用）を利用
         tsp_over_clusters = TSP(
             self.client, gra_distances, demands, capacity,
             nvehicle, args.nt, cluster_nums, str(save_dir), grax, gray, str(before_path)
@@ -182,7 +184,6 @@ class Core:
             print(f"\n===== Iteration {iteration} =====")
             swap_time_log: List[Dict[str, Any]] = []
             moved_total = 0
-            touched_clusters = set()  # この反復で内容が変わった(=TSP解く対象)
 
             # Adjacency along perms
             for idx, current_cluster_index in enumerate(perms):
@@ -216,7 +217,7 @@ class Core:
                 t_block_start = time.perf_counter()
 
                 # Latest state snapshot for current cluster
-                cur_ids = clusters[current_cluster_index]               # city ids
+                cur_ids = clusters[current_cluster_index]               # city ids (global index)
                 cur_xs  = clusters_coordx[current_cluster_index]
                 cur_ys  = clusters_coordy[current_cluster_index]
                 cur_cx  = gra_clusters_coordx[current_cluster_index]
@@ -242,7 +243,7 @@ class Core:
                     restcapacity,
                     capacity,
                     args.nt,
-                    cur_ids,                # latest city id list
+                    cur_ids,                # latest city id list (global index)
                     str(before_path)
                 )
                 pro_result = proccesor.QA_processors()
@@ -252,9 +253,6 @@ class Core:
                 did_move = bool(moved_arr.sum() > 0.5)
                 if did_move:
                     moved_total += 1
-                    # from側とto側の2クラスタは内容が変わるので記録
-                    touched_clusters.add(int(current_cluster_index))
-                    touched_clusters.add(int(next_cluster_index))
 
                 # Timing
                 t_block_end = time.perf_counter()
@@ -277,7 +275,6 @@ class Core:
                     )
 
                 # Recompute "after" from the (possibly) updated latest state.
-                # If did_move==False, latest==before-state -> natural equality (no explicit assignment needed).
                 cur_after_xs = clusters_coordx[current_cluster_index]
                 cur_after_ys = clusters_coordy[current_cluster_index]
                 cur_after_cx = gra_clusters_coordx[current_cluster_index]
@@ -304,69 +301,107 @@ class Core:
                 print(f"[swap {idx}] move={did_move} | qa={qa_ms:.1f}ms | total={block_ms:.1f}ms | "
                       f"before={sum_before:.3f} | after={sum_after:.3f}")
 
-            # ---- ここから挙動変更部分 (常に全クラスタのTSPを解く) ----
-            # 都市交換の有無に関わらず、このイテレーションでは常に全てのクラスタでTSPを解く
+            # 📝 swap のログを保存
+            swap_log_path = save_dir / f"iteration_{iteration}_swap_timings.json"
+            with swap_log_path.open("w") as f:
+                json.dump(swap_time_log, f, indent=2, default=to_native)
+            print(f"💾 Saved swap details: {swap_log_path}")
+
+            # ---- ここから: 交換の有無に関わらず「全クラスタ」でTSPを解く ----
             all_clusters = set(range(len(clusters)))
-            target_clusters = all_clusters # ★ 常に全クラスタを対象とする
-            
+            target_clusters = all_clusters
+
             print(f"🔄 Solving TSP for ALL {len(target_clusters)} clusters in iteration {iteration}.")
 
-            # 交換があったクラスタ「以外」のクラスタ（または収束時は全クラスタ）で TSP を解く
             total_distance = 0.0
             tsp_routes: List[Dict[str, Any]] = []
+
             if args.tsp_solver == "ortools":
+                # OR-Tools 版
                 for cluster_id in sorted(target_clusters):
+                    # ローカル座標（depot + クラスタ内都市）
                     coordx = [depo_x] + clusters_coordx[cluster_id]
                     coordy = [depo_y] + clusters_coordy[cluster_id]
                     cluster_distance = vrpfactory.make_cluster_distance_matrix(coordx, coordy)
 
                     ort = solve_tsp_ortools(cluster_distance, time_limit_ms=args.tsp_time_limit_ms)
-                    solver_status = ""
+
+                    # OR-Tools ラッパの戻り値に両対応
                     if isinstance(ort, dict):
-                        route = ort.get("route", [])
+                        route_local = ort.get("route", [])
                         tot = ort.get("total_distance")
                         solver_status = ort.get("solver_status", "")
                         solve_time_ms = ort.get("solve_time_ms", None)
                     else:
-                        route = ort
+                        route_local = ort
                         tot = None
                         solver_status = ""
                         solve_time_ms = None
 
+                    # 🔁 ローカルインデックス → グローバル都市インデックスへ変換
+                    # route_local: 0 はdepot、1..k がクラスタ内ローカル
+                    cluster_global_ids = clusters[cluster_id]  # 長さ k
+                    route_global = []
+                    for node in route_local:
+                        if node == 0:
+                            # depot は 0 のままにしておく（必要なら別表現でもOK）
+                            route_global.append(0)
+                        else:
+                            idx = node - 1
+                            if 0 <= idx < len(cluster_global_ids):
+                                route_global.append(int(cluster_global_ids[idx]))
+                            else:
+                                # ありえない値はそのまま入れておく（デバッグ用）
+                                route_global.append(int(node))
+
                     tsp_routes.append({
-                        "cluster_id":     int(cluster_id),
-                        "route":          route,
-                        "total_distance": tot,
-                        "solver":         "ortools",
-                        "solver_status":  solver_status,
-                        "solve_time_ms":  solve_time_ms
+                        "cluster_id":       int(cluster_id),
+                        "route_local":      route_local,
+                        "route_global":     route_global,  # ★ グローバル都市インデックス
+                        "total_distance":   tot,
+                        "solver":           "ortools",
+                        "solver_status":    solver_status,
+                        "solve_time_ms":    solve_time_ms,
                     })
+
                     if tot is not None:
                         total_distance += tot
+
             else:
-                # 互換のために amplify(TSP) を選べるよう残す（必要なら）
+                # Amplify TSP 版（必要なら使う）
                 from TSP import TSP
                 for cluster_id in sorted(target_clusters):
                     coordx = [depo_x] + clusters_coordx[cluster_id]
                     coordy = [depo_y] + clusters_coordy[cluster_id]
                     cluster_demand = [0] + cluster_demands[cluster_id]
-                    city_list = [0] + clusters[cluster_id]
+                    city_list = [0] + clusters[cluster_id]  # 先頭0がdepot、以降はグローバル都市ID
                     cluster_distance = vrpfactory.make_cluster_distance_matrix(coordx, coordy)
-                    tsp_solver = TSP(self.client, cluster_distance, cluster_demand, capacity,
-                                     1, args.nt, city_list, str(save_dir), coordx, coordy, str(before_path))
+                    tsp_solver = TSP(
+                        self.client, cluster_distance, cluster_demand, capacity,
+                        1, args.nt, city_list, str(save_dir), coordx, coordy, str(before_path)
+                    )
                     result = tsp_solver.solve_TSP(args.p, args.q)
                     dist_val = float(result.get("total_distances", 0.0))
+
+                    # Amplify版は route がすでに city_list 上のインデックス or ID になっている想定。
+                    # 必要に応じて整形して route_global に積む。
+                    route_sol = result.get("route", [])
+                    route_global = to_native(route_sol)
+
                     tsp_routes.append({
-                        "cluster_id":     int(cluster_id),
-                        "route":          to_native(result.get("route")),
-                        "total_distance": dist_val,
-                        "solver":         "amplify",
+                        "cluster_id":       int(cluster_id),
+                        "route_local":      to_native(route_sol),
+                        "route_global":     route_global,
+                        "total_distance":   dist_val,
+                        "solver":           "amplify",
+                        "solver_status":    "SUCCESS",
+                        "solve_time_ms":    None,
                     })
                     total_distance += dist_val
 
             print(f"📏 Total distance (ALL clusters) after iteration {iteration}: {total_distance:.6f}")
             iteration_path = save_dir / f"iteration_{iteration}.json"
-            with open(iteration_path, "w") as f:
+            with iteration_path.open("w") as f:
                 json.dump(tsp_routes, f, indent=2, default=to_native)
             print(f"💾 Saved: {iteration_path}")
 
@@ -378,7 +413,6 @@ class Core:
             if iteration >= args.max_iter:
                 print("⚠️ Reached max iterations. Stop.")
                 break
-
 
         print("\n✅ Optimization completed.")
         print(f"📂 Results saved in: {save_dir}")

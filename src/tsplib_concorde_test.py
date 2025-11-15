@@ -1,14 +1,29 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+TSPLIB の .tsp をまとめて Concorde（tsp_concorde.solve_tsp_concorde）で解いて
+BEST_KNOWN と比較し、CSV にまとめるベンチマークスクリプト。
+
+前提:
+- 同じディレクトリに tsp_concorde.py があり、以下の関数が定義されていること:
+    solve_tsp_concorde(dist_matrix, work_dir, seed=None, concorde_bin=None)
+- solve_tsp_concorde は:
+    - ルート補完を一切行わない
+    - solver_status != "SUCCESS" の場合 route は None になる
+"""
+
 import sys
 import math
-import time
-import subprocess
 import argparse
 import csv
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 
+from tsp_concorde import solve_tsp_concorde
+
 # --- 既知の最適解 (BEST_KNOWN) ---
-BEST_KNOWN = {
+BEST_KNOWN: Dict[str, Optional[int]] = {
     "att48": 10628,
     "berlin52": 7542,
     "bier127": 118282,
@@ -61,13 +76,55 @@ BEST_KNOWN = {
     "ali535": None,    # 535 → 除外
 }
 
+def save_results_to_csv(csv_path: str | Path, rows: List[Dict[str, Any]]):
+    """
+    solve_tsp_concorde → tsplib_concorde_test 側で集めた結果 rows を CSV に保存する
+    """
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
 
-# --- (1) 既存の read_tsplib 関数 ---
-def read_tsplib(tsp_path: Path) -> Dict:
-    name = None
-    dim = None
-    edge_weight_type = None
-    edge_weight_format = None
+    fieldnames = [
+        "Instance",
+        "DIMENSION",
+        "Best_Known",
+        "Optimal_STDOUT",
+        "Calculated_Cost",
+        "Best_Known_Diff",
+        "Stdout_Diff",
+        "GAP_Pct",
+        "Status",
+        "Time_sec",
+        "Message",
+    ]
+
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"📄 CSV 保存完了: {csv_path}")
+
+
+# --- TSPLIB 読み取り（座標 or FULL_MATRIX） ---
+def read_tsplib(tsp_path: Path) -> Dict[str, Any]:
+    """
+    TSPLIB TSP ファイルの必要な情報だけ読み取る。
+
+    戻り値:
+        {
+            "name": str | None,
+            "dim": int,
+            "edge_weight_type": str,      # 例: "EUC_2D", "EXPLICIT"
+            "edge_weight_format": str | None,
+            "coords": List[(x, y)] | None,
+            "dist_matrix": List[List[int]] | None,
+        }
+    """
+    name: Optional[str] = None
+    dim: Optional[int] = None
+    edge_weight_type: Optional[str] = None
+    edge_weight_format: Optional[str] = None
     coords: List[Tuple[float, float]] = []
     dist_matrix: Optional[List[List[int]]] = None
 
@@ -98,7 +155,7 @@ def read_tsplib(tsp_path: Path) -> Dict:
     if edge_weight_type is None:
         raise ValueError("EDGE_WEIGHT_TYPE が見つかりません")
 
-    # 座標読み (EUC_2D)
+    # 座標読み (NODE_COORD_SECTION)
     if any(line.upper().strip() == "NODE_COORD_SECTION" for line in lines):
         reading = False
         for line in lines:
@@ -107,7 +164,7 @@ def read_tsplib(tsp_path: Path) -> Dict:
             if u == "NODE_COORD_SECTION":
                 reading = True
                 continue
-            if u == "EOF" or u == "DEMAND_SECTION" or u == "CAPACITY":
+            if u in ("EOF", "DEMAND_SECTION", "CAPACITY"):
                 break
             if ":" in s and not reading:
                 continue
@@ -154,130 +211,37 @@ def read_tsplib(tsp_path: Path) -> Dict:
         "dist_matrix": dist_matrix,
     }
 
-# --- (2) 既存の calc_tour_cost 関数 ---
-def calc_tour_cost(info: Dict, tour_zero_based: List[int]) -> float:
-    dim = info["dim"]
-    if len(tour_zero_based) == dim + 1 and tour_zero_based[0] == tour_zero_based[-1]:
-        tour_zero_based = tour_zero_based[:-1]
 
-    if len(tour_zero_based) != dim:
-        seen = set(tour_zero_based)
-        missing = [i for i in range(dim) if i not in seen]
-        tour_zero_based = tour_zero_based + missing
-
-    etype = info["edge_weight_type"]
-    coords = info["coords"]
-    dist_matrix = info["dist_matrix"]
-
-    total = 0.0
-    if etype == "EUC_2D":
-        if coords is None:
-            raise ValueError("coords が必要です (EUC_2D)")
-        for i in range(dim):
-            a = tour_zero_based[i]
-            b = tour_zero_based[(i + 1) % dim]
-            x1, y1 = coords[a]
-            x2, y2 = coords[b]
-            total += math.hypot(x1 - x2, y1 - y2) 
-    elif etype == "EXPLICIT":
-        if dist_matrix is None:
-            raise ValueError("dist_matrix が必要です (EXPLICIT)")
-        for i in range(dim):
-            a = tour_zero_based[i]
-            b = tour_zero_based[(i + 1) % dim]
-            total += dist_matrix[a][b]
-    else:
-        raise NotImplementedError(f"EDGE_WEIGHT_TYPE={etype} は未対応")
-
-    return total
-
-# --- (3) 既存の solve_tsplib_with_concorde 関数 ---
-def solve_tsplib_with_concorde(tsp_file: str, workdir: str = "concorde_tsplib_test") -> Dict[str, Any]:
-    tsp_path = Path(tsp_file).resolve()
-    workdir_path = Path(workdir).resolve()
-    workdir_path.mkdir(parents=True, exist_ok=True)
-
-    local_tsp = workdir_path / tsp_path.name
-    
-    if local_tsp != tsp_path:
-        local_tsp.write_bytes(tsp_path.read_bytes())
-
-    start = time.perf_counter()
-    proc = subprocess.run(
-        ["concorde", local_tsp.name],
-        cwd=str(workdir_path),
-        capture_output=True,
-        text=True,
-    )
-    elapsed = time.perf_counter() - start
-
-    if proc.returncode != 0:
-        return {
-            "ok": False,
-            "elapsed": elapsed,
-            "tour_file": None,
-            "cost": None,
-            "msg": f"Concorde failed: {proc.stderr}",
-        }
-
-    # tour ファイル(.sol or .tour) 探す
-    stem = local_tsp.stem
-    tour_path = None
-    for ext in (".sol", ".tour"):
-        cand = workdir_path / f"{stem}{ext}"
-        if cand.exists():
-            tour_path = cand
-            break
-
-    if tour_path is None:
-        return {
-            "ok": False,
-            "elapsed": elapsed,
-            "tour_file": None,
-            "cost": None,
-            "msg": "tour file not found",
-        }
-
-    # TOUR_SECTION 読み取り
-    tour_idx = []
-    reading = False
-    for line in tour_path.read_text().splitlines():
-        s = line.strip()
-        if s == "TOUR_SECTION":
-            reading = True
-            continue
-        if not reading:
-            continue
-        if s in ("-1", "EOF"):
-            break
-        try:
-            tour_idx.append(int(s) - 1)
-        except ValueError:
-            pass
-
-    info = read_tsplib(local_tsp) 
-    cost = calc_tour_cost(info, tour_idx)
-
-    return {
-        "ok": True,
-        "elapsed": elapsed,
-        "tour_file": str(tour_path),
-        "cost": cost,
-        "msg": "",
-    }
+# --- EUC_2D 用の距離行列生成（TSPLIB の丸め仕様に合わせる） ---
+def build_euc2d_dist_matrix(coords: List[Tuple[float, float]]) -> List[List[int]]:
+    """
+    TSPLIB の EUC_2D 距離:
+        d(i,j) = int( sqrt( (xi-xj)^2 + (yi-yj)^2 ) + 0.5 )
+    """
+    n = len(coords)
+    dmat = [[0] * n for _ in range(n)]
+    for i in range(n):
+        x1, y1 = coords[i]
+        for j in range(n):
+            if i == j:
+                continue
+            x2, y2 = coords[j]
+            dij = math.hypot(x1 - x2, y1 - y2)
+            dmat[i][j] = int(dij + 0.5)
+    return dmat
 
 
-# --- (4) 拡張された main 関数 ---
-def main():
+# --- メイン: TSPLIB → Concorde → CSV ---
+def main() -> None:
     ap = argparse.ArgumentParser(
-        description="指定されたディレクトリ内のTSPLIBファイルをConcordeで解き、結果をCSVに出力します。"
+        description="TSPLIB .tsp を tsp_concorde.solve_tsp_concorde で解いて CSV にまとめる"
     )
     ap.add_argument("path", help="処理対象のファイル、またはディレクトリパス", type=str)
     ap.add_argument(
-        "--max_dim", 
-        help="処理する都市数(DIMENSION)の最大上限 (この値以下の問題のみ処理)", 
-        type=int, 
-        default=sys.maxsize
+        "--max_dim",
+        help="処理する都市数(DIMENSION)の最大上限 (この値以下の問題のみ処理)",
+        type=int,
+        default=sys.maxsize,
     )
     ap.add_argument(
         "--output",
@@ -285,16 +249,23 @@ def main():
         type=str,
         default="concorde_results.csv",
     )
+    ap.add_argument(
+        "--workdir",
+        help="Concorde 実行用の一時ディレクトリ",
+        type=str,
+        default="_concorde_work_tsplib",
+    )
     args = ap.parse_args()
-    
+
     target_path = Path(args.path).resolve()
     max_dim = args.max_dim
-    
-    # 処理対象のファイルリストを決定
-    tsp_files = []
+    workdir = args.workdir
+
+    # 処理対象 .tsp リスト
+    tsp_files: List[Path] = []
     if target_path.is_dir():
-        print(f"📂 ディレクトリ '{target_path.name}' 内の .tsp ファイルを検索中...")
-        tsp_files.extend(target_path.rglob("*.tsp"))
+        print(f"📂 ディレクトリ '{target_path}' 内の .tsp ファイルを再帰的に検索中...")
+        tsp_files.extend(sorted(target_path.rglob("*.tsp")))
     elif target_path.is_file():
         tsp_files.append(target_path)
     else:
@@ -302,59 +273,127 @@ def main():
         return
 
     results_list: List[Dict[str, Any]] = []
-    
+
     print(f"🔍 処理対象のファイル数: {len(tsp_files)}")
     if max_dim != sys.maxsize:
-        print(f"📏 都市数上限: {max_dim} を超えるファイルはスキップされます。")
+        print(f"📏 都市数上限: {max_dim} を超えるファイルはスキップします。")
 
-    # ファイルを一つずつ処理
     for tsp_file_path in tsp_files:
-        print(f"\n--- 処理中: {tsp_file_path.name} ---")
         instance_stem = tsp_file_path.stem
-        
-        try:
-            # 都市数(DIMENSION)を読み込み、フィルタリング
-            info = read_tsplib(tsp_file_path)
-            dim = info['dim']
-            
-            if dim > max_dim:
-                print(f"⏭️ スキップ (都市数 {dim} > 上限 {max_dim})")
-                continue
-                
-            # BEST_KNOWNの取得
-            best_known_cost = BEST_KNOWN.get(instance_stem)
-            
-            print(f"✅ 都市数: {dim} / BEST_KNOWN: {best_known_cost}")
+        print(f"\n--- 処理中: {tsp_file_path.name} ---")
 
-            # Concordeで解く
-            res = solve_tsplib_with_concorde(str(tsp_file_path))
-            
-            calculated_cost = res['cost']
-            gap_pct = "N/A"
-            
-            # GAPの計算 (BEST_KNOWN が None ではなく、0 よりも大きい場合)
-            if res['ok'] and calculated_cost is not None and best_known_cost is not None and best_known_cost > 0:
-                # Concordeは正確な解を出すため、通常はコスト >= BEST_KNOWN となる
-                gap = (calculated_cost - best_known_cost) / best_known_cost * 100.0
-                gap_pct = f"{gap:.4f}"
-            
-            result = {
+        try:
+            info = read_tsplib(tsp_file_path)
+            dim = int(info["dim"])
+            etype = info["edge_weight_type"]
+            eformat = info["edge_weight_format"]
+            coords = info["coords"]
+            explicit_matrix = info["dist_matrix"]
+
+            if dim > max_dim:
+                print(f"⏭️ スキップ: DIMENSION={dim} > max_dim={max_dim}")
+                results_list.append({
+                    "Instance": instance_stem,
+                    "DIMENSION": dim,
+                    "Best_Known": BEST_KNOWN.get(instance_stem, "N/A"),
+                    "Calculated_Cost": "N/A",
+                    "GAP_Pct": "N/A",
+                    "Status": "SKIP_DIM",
+                    "Time_sec": "N/A",
+                    "Message": f"DIMENSION {dim} > max_dim {max_dim}",
+                })
+                continue
+
+            best_known_cost = BEST_KNOWN.get(instance_stem)
+            print(f"✅ DIMENSION={dim}, EDGE_WEIGHT_TYPE={etype}, BEST_KNOWN={best_known_cost}")
+
+            # --- 距離行列の構築 ---
+            if etype == "EUC_2D":
+                if coords is None:
+                    raise ValueError("coords が必要です (EUC_2D)")
+                dist_matrix = build_euc2d_dist_matrix(coords)
+            elif etype == "EXPLICIT" and eformat == "FULL_MATRIX":
+                if explicit_matrix is None:
+                    raise ValueError("dist_matrix が必要です (EXPLICIT/FULL_MATRIX)")
+                dist_matrix = explicit_matrix
+            else:
+                msg = f"EDGE_WEIGHT_TYPE={etype}, FORMAT={eformat} は未対応のためスキップ"
+                print(f"⏭️ {msg}")
+                results_list.append({
+                    "Instance": instance_stem,
+                    "DIMENSION": dim,
+                    "Best_Known": best_known_cost if best_known_cost is not None else "N/A",
+                    "Calculated_Cost": "N/A",
+                    "GAP_Pct": "N/A",
+                    "Status": "SKIP_UNSUPPORTED_EDGE_WEIGHT",
+                    "Time_sec": "N/A",
+                    "Message": msg,
+                })
+                continue
+
+            # --- Concorde (tsp_concorde) で解く ---
+            res = solve_tsp_concorde(dist_matrix, work_dir=workdir)
+
+            solver_status = res.get("solver_status", "UNKNOWN")
+            route = res.get("route")
+            total_distance = res.get("total_distance")
+            elapsed_sec = res.get("solve_time_ms", 0) / 1000.0
+
+            if solver_status != "SUCCESS" or route is None or total_distance is None:
+                msg = f"solver_status={solver_status}"
+                print(f"❌ FAIL: {msg}")
+                results_list.append({
+                    "Instance": instance_stem,
+                    "DIMENSION": dim,
+                    "Best_Known": best_known_cost if best_known_cost is not None else "N/A",
+                    "Calculated_Cost": "N/A",
+                    "GAP_Pct": "N/A",
+                    "Status": "FAILED",
+                    "Time_sec": f"{elapsed_sec:.3f}",
+                    "Message": msg,
+                })
+                continue
+
+            calculated_cost = float(total_distance)
+            gap_pct_str = "N/A"
+            if best_known_cost is not None and best_known_cost > 0:
+                gap = (calculated_cost - best_known_cost) * 100.0 / best_known_cost
+                gap_pct_str = f"{gap:.4f}"
+            best_known_diff = (
+                calculated_cost - best_known_cost
+                if best_known_cost is not None else "N/A"
+            )
+
+            stdout_optimal = res.get("optimal_value_stdout")
+            stdout_diff = (
+                calculated_cost - stdout_optimal
+                if stdout_optimal is not None else "N/A"
+            )
+     
+
+            result_row = {
                 "Instance": instance_stem,
                 "DIMENSION": dim,
                 "Best_Known": best_known_cost if best_known_cost is not None else "N/A",
-                "Calculated_Cost": f"{calculated_cost:.4f}" if calculated_cost is not None else "N/A",
-                "GAP_Pct": gap_pct,
-                "Status": "SUCCESS" if res['ok'] else "FAILED",
-                "Time_sec": f"{res['elapsed']:.3f}",
-                "Message": res['msg'].strip() if res['msg'] else "",
+                "Optimal_STDOUT": stdout_optimal if stdout_optimal is not None else "N/A",
+                "Calculated_Cost": f"{calculated_cost:.4f}",
+                "Best_Known_Diff": best_known_diff,
+                "Stdout_Diff": stdout_diff,
+                "GAP_Pct": gap_pct_str,
+                "Status": "SUCCESS",
+                "Time_sec": f"{elapsed_sec:.3f}",
+                "Message": "",
             }
-            results_list.append(result)
-            
-            print(f"    結果: {result['Status']}, コスト: {result['Calculated_Cost']}, GAP: {result['GAP_Pct']} %, 時間: {result['Time_sec']} sec")
+
+            results_list.append(result_row)
+
+            print(
+                f"    ✅ Status=SUCCESS, Cost={result_row['Calculated_Cost']}, "
+                f"GAP={gap_pct_str} %, Time={result_row['Time_sec']} sec"
+            )
 
         except Exception as e:
-            # 処理失敗時のログ
-            print(f"❌ 処理中にエラーが発生しました: {type(e).__name__}: {e}")
+            print(f"❌ 処理中にエラー: {type(e).__name__}: {e}")
             results_list.append({
                 "Instance": instance_stem,
                 "DIMENSION": "N/A",
@@ -367,22 +406,12 @@ def main():
             })
             continue
 
-    # --- CSVへの書き出し ---
+    # --- CSV 書き出し ---
     if results_list:
-        csv_path = Path(args.output).resolve()
-        fieldnames = ["Instance", "DIMENSION", "Best_Known", "Calculated_Cost", "GAP_Pct", "Status", "Time_sec", "Message"]
-        
-        try:
-            with open(csv_path, 'w', newline='', encoding='utf-8') as csvfile:
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(results_list)
-            
-            print(f"\n🎉 処理完了。結果は '{csv_path.name}' に保存されました。")
-        except Exception as e:
-             print(f"\n❌ CSV書き出し中にエラーが発生しました: {e}")
+        save_results_to_csv(args.output, results_list)
     else:
-        print("\n⚠️ 処理されたファイルはありませんでした。")
+        print("\n⚠️ 処理されたファイルがありませんでした。")
+
 
 if __name__ == "__main__":
     main()
