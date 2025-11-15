@@ -1,16 +1,14 @@
 #!/bin/zsh
 # =============================================
-# TSPLIB + Concorde ベンチマーク一括実行スクリプト
-# 対象: 複数の .tsp を tsplib_concorde_test.py 経由で解く
-# 出力:
-#   - out_concorde/<インスタンス名>_concorde.csv
-#   - out_concorde/all_concorde_merged.csv（結合版）
+# qaxapcore をまとめて実行するスクリプト
+# - before_data.json を順番に読んで Qknapcore.py を実行
+# - Concorde でクラスタ内 TSP を解く設定
 # =============================================
 
 set -euo pipefail
 
 # ---------- 設定 ----------
-# CVRP のインスタンス名をそのまま使う想定
+# 実験したいインスタンス名
 INSTANCES=(
   "E-n101-k14"
   "E-n101-k8"
@@ -24,63 +22,42 @@ INSTANCES=(
   "X-n1001-k43"
 )
 
-# .tsp ファイルが置いてあるディレクトリ
-# 例: ./instance/tsp/E-n101-k14.tsp
-TSP_DIR="./instance/tsp"
+# before_data.json が置いてあるディレクトリ
+OUT_DIR="./out"
 
-# 出力先ディレクトリ
-OUT_DIR="./out_concorde"
-mkdir -p "${OUT_DIR}"
-
-# 1ファイルごとに CSV を作るか？
-MAKE_PER_INSTANCE_CSV=true
+# Qknapcore のパラメータ
+ANNEAL_MS=10000      # --t （アニーリング時間 ms）
+NT=3                 # -nt （QA の繰り返し回数）
+MAX_ITER=100         # --max_iter
+TSP_SOLVER="concorde"  # "ortools" / "concorde" / "amplify" から選択
 
 # ---------- 実行 ----------
-CSV_LIST=()
-
 for inst in "${INSTANCES[@]}"; do
   echo "====================================="
   echo "🎯 インスタンス: ${inst}"
   echo "====================================="
 
-  TSP_PATH="${TSP_DIR}/${inst}.tsp"
+  JSON_PATH="${OUT_DIR}/${inst}_before_data.json"
 
-  if [[ ! -f "${TSP_PATH}" ]]; then
-    echo "⚠️ .tsp ファイルが見つかりません: ${TSP_PATH}"
+  if [[ ! -f "$JSON_PATH" ]]; then
+    echo "⚠️ before_data.json が見つかりません: $JSON_PATH"
     continue
   fi
 
-  # 個別 CSV のファイル名
-  OUT_CSV="${OUT_DIR}/${inst}_concorde.csv"
-
-  echo "🚀 Concorde 実行 (tsplib_concorde_test.py 経由)..."
-  python3 tsplib_concorde_test.py \
-    "${TSP_PATH}" \
-    --max_dim 100000 \
-    --output "${OUT_CSV}"
+  echo "🚀 Qknapcore.py 実行開始..."
+  python3 src/Qknapcore.py \
+    -j "$JSON_PATH" \
+    -sp "$OUT_DIR" \
+    --t "$ANNEAL_MS" \
+    -nt "$NT" \
+    --max_iter "$MAX_ITER" \
+    --tsp_solver "$TSP_SOLVER"
 
   if [[ $? -eq 0 ]]; then
-    echo "✅ 完了: ${inst} → ${OUT_CSV}"
-    CSV_LIST+=("${OUT_CSV}")
+    echo "✅ 完了: ${inst}"
   else
     echo "❌ エラー発生: ${inst}"
   fi
 done
 
-# ---------- CSV 結合（オプション） ----------
-if [[ "${#CSV_LIST[@]}" -gt 0 ]]; then
-  MERGED_CSV="${OUT_DIR}/all_concorde_merged.csv"
-  echo "🧩 CSV を結合します → ${MERGED_CSV}"
-
-  # 1つ目のヘッダ + 以降はデータ行だけ結合
-  head -n 1 "${CSV_LIST[1]}" > "${MERGED_CSV}"
-  for csv in "${CSV_LIST[@]}"; do
-    tail -n +2 "${csv}" >> "${MERGED_CSV}"
-  done
-
-  echo "🎉 結合 CSV 完成: ${MERGED_CSV}"
-else
-  echo "⚠️ 有効な CSV が 1 件も生成されませんでした。"
-fi
-
-echo "🎉 すべてのインスタンスで Concorde 実行が完了しました。"
+echo "🎉 すべてのインスタンスで Qknapcore 実行が完了しました。"
