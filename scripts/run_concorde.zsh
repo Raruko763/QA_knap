@@ -11,15 +11,15 @@ set -euo pipefail
 # 実験したいインスタンス名
 INSTANCES=(
   "E-n101-k14"
+  "X-n856-k95"
+  "Leuven2"
+  "X-n1001-k43"
   "E-n101-k8"
   "E-n76-k14"
   "E-n76-k10"
   "E-n76-k8"
   "E-n76-k7"
   "E-n51-k5"
-  "X-n856-k95"
-  "Leuven2"
-  "X-n1001-k43"
 )
 
 # before_data.json が置いてあるディレクトリ
