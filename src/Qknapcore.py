@@ -106,10 +106,15 @@ class Core:
         ap.add_argument("--max_iter", help="Max iterations",                 type=int, default=50)
         ap.add_argument(
             "--tsp_solver",
-            choices=["ortools", "concorde", "amplify"],
+            choices=["ortools", "concorde", "amplify", "compare"],
             default="ortools",
-            help="TSP solver to use for per-cluster TSP: 'ortools', 'concorde', or 'amplify'",
+            help=(
+                "TSP solver to use for per-cluster TSP: "
+                "'ortools', 'concorde', 'amplify', or 'compare' "
+                "(compare = Concorde + Amplify 両方実行)"
+            ),
         )
+
         ap.add_argument(
             "--tsp_time_limit_ms",
             type=int,
@@ -419,7 +424,7 @@ class Core:
                     if tot is not None and solver_status == "SUCCESS":
                         total_distance += float(tot)
 
-            else:
+            elif args.tsp_solver == "amplify":
                 # === Amplify TSP 版 ================================================
                 from TSP import TSP
                 for cluster_id in sorted(target_clusters):
@@ -448,6 +453,91 @@ class Core:
                         "solve_time_ms":    None,
                     })
                     total_distance += dist_val
+
+
+            else:
+                # === compare モード: Concorde + Amplify の両方を同じ距離行列で解く ===
+                from TSP import TSP
+                concorde_work_dir = save_dir / f"concorde_work_iter_{iteration}"
+
+                total_concorde = 0.0
+                total_amplify = 0.0
+
+                for cluster_id in sorted(target_clusters):
+                    coordx = [depo_x] + clusters_coordx[cluster_id]
+                    coordy = [depo_y] + clusters_coordy[cluster_id]
+                    cluster_demand = [0] + cluster_demands[cluster_id]
+                    city_list = [0] + clusters[cluster_id]
+                    cluster_distance = vrpfactory.make_cluster_distance_matrix(coordx, coordy)
+
+                    # --- 1) Concorde ---
+                    res_c = solve_tsp_concorde(cluster_distance, work_dir=concorde_work_dir)
+                    route_local_c = res_c.get("route") or []
+                    cluster_global_ids = clusters[cluster_id]
+                    route_global_c: List[int] = []
+                    for node in route_local_c:
+                        if node == 0:
+                            route_global_c.append(0)
+                        else:
+                            idx = node - 1
+                            if 0 <= idx < len(cluster_global_ids):
+                                route_global_c.append(int(cluster_global_ids[idx]))
+                            else:
+                                route_global_c.append(int(node))
+
+                    cost_route_c = res_c.get("cost_from_route")
+                    cost_stdout_c = res_c.get("cost_from_stdout")
+                    if cost_route_c is not None and res_c.get("solver_status") == "SUCCESS":
+                        total_concorde += float(cost_route_c)
+
+                    # --- 2) Amplify (同じ距離行列 cluster_distance を使用) ---
+                    tsp_solver = TSP(
+                        self.client, cluster_distance, cluster_demand, capacity,
+                        1, args.nt, city_list, str(save_dir), coordx, coordy, str(before_path)
+                    )
+                    res_a = tsp_solver.solve_TSP(args.p, args.q)
+
+                    route_idx_a = res_a.get("route_idx", [])
+                    route_global_a = to_native(res_a.get("route", []))
+                    route_distance_a = float(res_a.get("route_distance", 0.0))
+                    objective_a = float(res_a.get("objective_value", res_a.get("total_distances", 0.0)))
+
+                    total_amplify += route_distance_a
+
+                    tsp_routes.append({
+                        "cluster_id": int(cluster_id),
+                        "distance_matrix_shape": [len(cluster_distance), len(cluster_distance)],
+
+                        "concorde": {
+                            "route_local":          route_local_c,
+                            "route_global":         route_global_c,
+                            "cost_from_route":      cost_route_c,
+                            "cost_from_stdout":     cost_stdout_c,
+                            "cost_diff":            res_c.get("cost_diff"),
+                            "solver_status":        res_c.get("solver_status"),
+                            "solve_time_ms":        res_c.get("solve_time_ms"),
+                        },
+
+                        "amplify": {
+                            "route_idx":            route_idx_a,
+                            "route_global":         route_global_a,
+                            "route_distance":       route_distance_a,
+                            "objective_value":      objective_a,
+                            "total_time":           res_a.get("overall", {}).get("total_time"),
+                            "execution_time":       res_a.get("overall", {}).get("execution_time"),
+                            "response_time":        res_a.get("overall", {}).get("response_time"),
+                            "solver_status":        "SUCCESS",
+                        },
+                    })
+
+                print(
+                    f"📏 Total distance (Concorde) after iteration {iteration}: {total_concorde:.6f}"
+                )
+                print(
+                    f"📏 Total distance (Amplify route_distance) after iteration {iteration}: {total_amplify:.6f}"
+                )
+                # compare モードでは total_distance は「Amplify の route_distance 合計」にしておく
+                total_distance = total_amplify
 
             print(f"📏 Total distance (ALL clusters) after iteration {iteration}: {total_distance:.6f}")
             iteration_path = save_dir / f"iteration_{iteration}.json"

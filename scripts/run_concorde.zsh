@@ -27,7 +27,7 @@ OUT_DIR="./out"
 
 # Qknapcore のパラメータ
 ANNEAL_MS=10000      # --t （アニーリング時間 ms）
-NT=3                 # -nt （QA の繰り返し回数）
+NT=1                 # -nt （QA の繰り返し回数）
 MAX_ITER=100         # --max_iter
 TSP_SOLVER="concorde"  # "ortools" / "concorde" / "amplify" から選択
 
