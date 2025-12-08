@@ -34,6 +34,7 @@ except Exception as e:
 from src.vrpfactory import vrpfactory
 from src.knap_divpro import knap_dippro
 from src.tsp_ortools import solve_tsp_ortools
+from src.tsp_concorde import solve_tsp_concorde  # ★ Concorde ラッパ
 
 
 # ---------- utils ----------
@@ -103,10 +104,18 @@ class Core:
         ap.add_argument("--p",  help="QA parameter p",                       type=float, default=1.0)
         ap.add_argument("--q",  help="QA parameter q",                       type=float, default=1.0)
         ap.add_argument("--max_iter", help="Max iterations",                 type=int, default=50)
-        ap.add_argument("--tsp_solver", choices=["ortools", "amplify"], default="ortools",
-                        help="TSP solver: use 'ortools' to avoid QUBO")
-        ap.add_argument("--tsp_time_limit_ms", type=int, default=2000,
-                        help="OR-Tools time limit per cluster (ms)")
+        ap.add_argument(
+            "--tsp_solver",
+            choices=["ortools", "concorde", "amplify"],
+            default="ortools",
+            help="TSP solver to use for per-cluster TSP: 'ortools', 'concorde', or 'amplify'",
+        )
+        ap.add_argument(
+            "--tsp_time_limit_ms",
+            type=int,
+            default=2000,
+            help="OR-Tools time limit per cluster (ms)",
+        )
         ap.add_argument("--eps", help="(unused, compat)",                    type=float, default=1e-3)
         args = ap.parse_args()
 
@@ -298,8 +307,10 @@ class Core:
                 }
                 swap_time_log.append(record)
 
-                print(f"[swap {idx}] move={did_move} | qa={qa_ms:.1f}ms | total={block_ms:.1f}ms | "
-                      f"before={sum_before:.3f} | after={sum_after:.3f}")
+                print(
+                    f"[swap {idx}] move={did_move} | qa={qa_ms:.1f}ms | total={block_ms:.1f}ms | "
+                    f"before={sum_before:.3f} | after={sum_after:.3f}"
+                )
 
             # 📝 swap のログを保存
             swap_log_path = save_dir / f"iteration_{iteration}_swap_timings.json"
@@ -317,47 +328,43 @@ class Core:
             tsp_routes: List[Dict[str, Any]] = []
 
             if args.tsp_solver == "ortools":
-                # OR-Tools 版
+                # === OR-Tools 版 ===================================================
                 for cluster_id in sorted(target_clusters):
-                    # ローカル座標（depot + クラスタ内都市）
                     coordx = [depo_x] + clusters_coordx[cluster_id]
                     coordy = [depo_y] + clusters_coordy[cluster_id]
                     cluster_distance = vrpfactory.make_cluster_distance_matrix(coordx, coordy)
 
                     ort = solve_tsp_ortools(cluster_distance, time_limit_ms=args.tsp_time_limit_ms)
 
-                    # OR-Tools ラッパの戻り値に両対応
                     if isinstance(ort, dict):
                         route_local = ort.get("route", [])
                         tot = ort.get("total_distance")
                         solver_status = ort.get("solver_status", "")
                         solve_time_ms = ort.get("solve_time_ms", None)
                     else:
+                        # 古い実装との互換
                         route_local = ort
                         tot = None
                         solver_status = ""
                         solve_time_ms = None
 
-                    # 🔁 ローカルインデックス → グローバル都市インデックスへ変換
-                    # route_local: 0 はdepot、1..k がクラスタ内ローカル
-                    cluster_global_ids = clusters[cluster_id]  # 長さ k
-                    route_global = []
+                    # ローカルインデックス(0=depot) → グローバル都市ID
+                    cluster_global_ids = clusters[cluster_id]
+                    route_global: List[int] = []
                     for node in route_local:
                         if node == 0:
-                            # depot は 0 のままにしておく（必要なら別表現でもOK）
-                            route_global.append(0)
+                            route_global.append(0)  # depot は 0 のまま
                         else:
                             idx = node - 1
                             if 0 <= idx < len(cluster_global_ids):
                                 route_global.append(int(cluster_global_ids[idx]))
                             else:
-                                # ありえない値はそのまま入れておく（デバッグ用）
                                 route_global.append(int(node))
 
                     tsp_routes.append({
                         "cluster_id":       int(cluster_id),
                         "route_local":      route_local,
-                        "route_global":     route_global,  # ★ グローバル都市インデックス
+                        "route_global":     route_global,
                         "total_distance":   tot,
                         "solver":           "ortools",
                         "solver_status":    solver_status,
@@ -365,10 +372,55 @@ class Core:
                     })
 
                     if tot is not None:
-                        total_distance += tot
+                        total_distance += float(tot)
+
+            elif args.tsp_solver == "concorde":
+                # === Concorde 版 ===================================================
+                concorde_work_dir = save_dir / f"concorde_work_iter_{iteration}"
+
+                for cluster_id in sorted(target_clusters):
+                    coordx = [depo_x] + clusters_coordx[cluster_id]
+                    coordy = [depo_y] + clusters_coordy[cluster_id]
+                    cluster_distance = vrpfactory.make_cluster_distance_matrix(coordx, coordy)
+
+                    res = solve_tsp_concorde(cluster_distance, work_dir=concorde_work_dir)
+
+                    route_local = res.get("route") or []
+                    tot = res.get("total_distance")
+                    solver_status = res.get("solver_status", "")
+                    solve_time_ms = res.get("solve_time_ms", None)
+
+                    cluster_global_ids = clusters[cluster_id]
+                    route_global: List[int] = []
+                    for node in route_local:
+                        if node == 0:
+                            route_global.append(0)
+                        else:
+                            idx = node - 1
+                            if 0 <= idx < len(cluster_global_ids):
+                                route_global.append(int(cluster_global_ids[idx]))
+                            else:
+                                route_global.append(int(node))
+
+                    tsp_routes.append({
+                        "cluster_id":       int(cluster_id),
+                        "route_local":      route_local,
+                        "route_global":     route_global,
+                        "total_distance":   tot,
+                        "solver":           "concorde",
+                        "solver_status":    solver_status,
+                        "solve_time_ms":    solve_time_ms,
+                        "optimal_value_stdout": res.get("optimal_value_stdout"),
+                        "cost_from_stdout":    res.get("cost_from_stdout"),
+                        "cost_from_route":     res.get("cost_from_route"),
+                        "cost_diff":           res.get("cost_diff"),
+                    })
+
+                    if tot is not None and solver_status == "SUCCESS":
+                        total_distance += float(tot)
 
             else:
-                # Amplify TSP 版（必要なら使う）
+                # === Amplify TSP 版 ================================================
                 from TSP import TSP
                 for cluster_id in sorted(target_clusters):
                     coordx = [depo_x] + clusters_coordx[cluster_id]
@@ -383,8 +435,6 @@ class Core:
                     result = tsp_solver.solve_TSP(args.p, args.q)
                     dist_val = float(result.get("total_distances", 0.0))
 
-                    # Amplify版は route がすでに city_list 上のインデックス or ID になっている想定。
-                    # 必要に応じて整形して route_global に積む。
                     route_sol = result.get("route", [])
                     route_global = to_native(route_sol)
 
