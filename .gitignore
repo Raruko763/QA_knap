@@ -8,3 +8,4 @@ settings.json
 *.csv
 LKH3-3.0.6/
 *.log
+src/__pycache__/
