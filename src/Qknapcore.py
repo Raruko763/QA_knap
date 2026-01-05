@@ -253,7 +253,12 @@ class Core:
                     capacity,
                     args.nt,
                     cur_ids,                # latest city id list (global index)
-                    str(before_path)
+                    str(before_path),
+                    depot_xy=(depo_x, depo_y),
+                    cur_xs=cur_xs,
+                    cur_ys=cur_ys,
+                    next_xs=clusters_coordx[next_cluster_index],
+                    next_ys=clusters_coordy[next_cluster_index],
                 )
                 pro_result = proccesor.QA_processors(p=args.p)
 

@@ -16,7 +16,23 @@ import re
 
 class knap_dippro:
 
-    def __init__(self,client,distances_from_mycluster,distances_from_nextcluster,demands,restcapacity_of_nextcluster,max_capacity,num_solve,city,file_path):
+    def __init__(
+        self,
+        client,
+        distances_from_mycluster,
+        distances_from_nextcluster,
+        demands,
+        restcapacity_of_nextcluster,
+        max_capacity,
+        num_solve,
+        city,
+        file_path,
+        depot_xy=None,
+        cur_xs=None,
+        cur_ys=None,
+        next_xs=None,
+        next_ys=None,
+    ):
         self.client = client
         self.distances_from_mycluster = np.array(distances_from_mycluster,dtype=int)
         self.distances_from_nextcluster = np.array(distances_from_nextcluster,dtype=int)
@@ -27,6 +43,11 @@ class knap_dippro:
         # self.x = x
         # self.y = y
         self.city = city
+        self.depot_xy = depot_xy
+        self.cur_xs = np.array(cur_xs) if cur_xs is not None else None
+        self.cur_ys = np.array(cur_ys) if cur_ys is not None else None
+        self.next_xs = np.array(next_xs) if next_xs is not None else None
+        self.next_ys = np.array(next_ys) if next_ys is not None else None
 
         # self.clu_path = clu_path
 
@@ -65,13 +86,35 @@ class knap_dippro:
         x = gen.array("Binary", shape=(n_mycluster))
         # print("x",x)
         # print("demand",self.demands)
-        #都市追加に関する目的関数
-        objective = einsum("i,i->", self.distances_from_nextcluster, x) + einsum("i,i->", self.distances_from_mycluster, (1 - x))
+        # 都市追加に関する目的関数（角度ベース）
+        eps = 1e-12
+
+        def _unit_vectors(xs, ys):
+            dx = xs - self.depot_xy[0]
+            dy = ys - self.depot_xy[1]
+            norms = np.sqrt(dx * dx + dy * dy) + eps
+            return np.stack([dx / norms, dy / norms], axis=1)
+
+        def _mean_direction(us):
+            vec = np.sum(us, axis=0)
+            norm = np.linalg.norm(vec)
+            if norm < 1e-12:
+                return np.array([0.0, 0.0])
+            return vec / norm
+
+        cur_us = _unit_vectors(self.cur_xs, self.cur_ys)
+        next_us = _unit_vectors(self.next_xs, self.next_ys)
+        v_a = _mean_direction(cur_us)
+        v_b = _mean_direction(next_us)
+
+        coef_ang = np.dot(cur_us, v_a) - np.dot(cur_us, v_b)
+        objective = einsum("i,i->", coef_ang, x)
+
         demands = np.array(self.demands)
         weight_sums = einsum("i,i->", demands, x)
         capacity_constraints: ConstraintList = less_equal(weight_sums, self.restcapacity_of_nextcluster, penalty_formulation="Relaxation",label='weight_sum')
-        maxdit = max(np.amax(self.distances_from_mycluster),np.amax(self.distances_from_nextcluster))
-        penalty_scale = maxdit * self.maxcapacity / self.restcapacity_of_nextcluster
+        maxcoef = max(np.max(np.abs(coef_ang)), 1e-9)
+        penalty_scale = maxcoef * self.maxcapacity / self.restcapacity_of_nextcluster
         if p is not None:
             penalty_scale *= p
         capacity_constraints *= penalty_scale
@@ -84,13 +127,13 @@ class knap_dippro:
         total_time= result.total_time.total_seconds()
         execution_time = result.execution_time.total_seconds()
         response_time = result.response_time.total_seconds()
-        total_distances =result.best.objective
+        total_objective =result.best.objective
         return  {
                     "route": swap_perms,
                     "total_time": total_time,
                     "execution_time": execution_time,
                     "response_time": response_time,
-                    "total_distances": total_distances,
+                    "total_objective": total_objective,
                     "n_city":n_mycluster
                 }
      
