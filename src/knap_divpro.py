@@ -59,7 +59,7 @@ class knap_dippro:
     #         total_distance = calculate_total_distance(route, distance_matrix)
     #         print(f"Total distance for vehicle {vehicle}: {total_distance}")
 
-    def QA_processors(self):
+    def QA_processors(self, p: float = None):
         n_mycluster = len(self.demands)
         gen = VariableGenerator()
         x = gen.array("Binary", shape=(n_mycluster))
@@ -71,7 +71,10 @@ class knap_dippro:
         weight_sums = einsum("i,i->", demands, x)
         capacity_constraints: ConstraintList = less_equal(weight_sums, self.restcapacity_of_nextcluster, penalty_formulation="Relaxation",label='weight_sum')
         maxdit = max(np.amax(self.distances_from_mycluster),np.amax(self.distances_from_nextcluster))
-        capacity_constraints *= maxdit*self.maxcapacity/self.restcapacity_of_nextcluster
+        penalty_scale = maxdit * self.maxcapacity / self.restcapacity_of_nextcluster
+        if p is not None:
+            penalty_scale *= p
+        capacity_constraints *= penalty_scale
         model= Model(objective,capacity_constraints)
 
         result = solve(model,self.client)

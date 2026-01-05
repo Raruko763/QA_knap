@@ -255,7 +255,7 @@ class Core:
                     cur_ids,                # latest city id list (global index)
                     str(before_path)
                 )
-                pro_result = proccesor.QA_processors()
+                pro_result = proccesor.QA_processors(p=args.p)
 
                 # Normalize moved -> 0/1 mask
                 moved_arr = normalize_moved(pro_result.get("route", []), len(cur_ids))
