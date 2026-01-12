@@ -116,6 +116,12 @@ class Core:
             default=2000,
             help="OR-Tools time limit per cluster (ms)",
         )
+        ap.add_argument(
+            "--stage2_mode",
+            choices=["depot_angle", "centroid_angle"],
+            default="depot_angle",
+            help="Stage2 objective: depot_angle (sweep-like) or centroid_angle (cluster-centric)",
+        )
         ap.add_argument("--eps", help="(unused, compat)",                    type=float, default=1e-3)
         args = ap.parse_args()
 
@@ -260,8 +266,11 @@ class Core:
                     next_xs=clusters_coordx[next_cluster_index],
                     next_ys=clusters_coordy[next_cluster_index],
                 )
-                pro_result = proccesor.QA_processors(p=args.p)
-
+                # if args.stage2_mode == "centroid_angle":
+                #     pro_result = proccesor.QA_processors_centroid_angle(p=args.p)
+                # else:
+                #     pro_result = proccesor.QA_processors_depot_angle(p=args.p)
+                pro_result = proccesor.QA_processors_centroid_angle(p=args.p)
                 # Normalize moved -> 0/1 mask
                 moved_arr = normalize_moved(pro_result.get("route", []), len(cur_ids))
                 did_move = bool(moved_arr.sum() > 0.5)
@@ -309,6 +318,7 @@ class Core:
                     "skipped":       False,
                     "sum_dist_current_before": float(sum_before),
                     "sum_dist_current_after":  float(sum_after),
+                    "stage2_mode":   args.stage2_mode,
                 }
                 swap_time_log.append(record)
 
