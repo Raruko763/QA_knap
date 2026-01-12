@@ -80,62 +80,80 @@ class knap_dippro:
     #         total_distance = calculate_total_distance(route, distance_matrix)
     #         print(f"Total distance for vehicle {vehicle}: {total_distance}")
 
-    def QA_processors(self, p: float = None):
+    def _unit_vectors(self, xs, ys, origin):
+        eps = 1e-12
+        dx = xs - origin[0]
+        dy = ys - origin[1]
+        norms = np.sqrt(dx * dx + dy * dy) + eps
+        return np.stack([dx / norms, dy / norms], axis=1)
+
+    def _mean_direction(self, us):
+        vec = np.sum(us, axis=0)
+        norm = np.linalg.norm(vec)
+        if norm < 1e-12:
+            return np.array([0.0, 0.0])
+        return vec / norm
+
+    def _solve_with_linear_objective(self, coef: np.ndarray, p: float, label: str):
         n_mycluster = len(self.demands)
         gen = VariableGenerator()
         x = gen.array("Binary", shape=(n_mycluster))
-        # print("x",x)
-        # print("demand",self.demands)
-        # 都市追加に関する目的関数（角度ベース）
-        eps = 1e-12
 
-        def _unit_vectors(xs, ys):
-            dx = xs - self.depot_xy[0]
-            dy = ys - self.depot_xy[1]
-            norms = np.sqrt(dx * dx + dy * dy) + eps
-            return np.stack([dx / norms, dy / norms], axis=1)
-
-        def _mean_direction(us):
-            vec = np.sum(us, axis=0)
-            norm = np.linalg.norm(vec)
-            if norm < 1e-12:
-                return np.array([0.0, 0.0])
-            return vec / norm
-
-        cur_us = _unit_vectors(self.cur_xs, self.cur_ys)
-        next_us = _unit_vectors(self.next_xs, self.next_ys)
-        v_a = _mean_direction(cur_us)
-        v_b = _mean_direction(next_us)
-
-        coef_ang = np.dot(cur_us, v_a) - np.dot(cur_us, v_b)
-        objective = einsum("i,i->", coef_ang, x)
-
+        objective = einsum("i,i->", coef, x)
         demands = np.array(self.demands)
         weight_sums = einsum("i,i->", demands, x)
-        capacity_constraints: ConstraintList = less_equal(weight_sums, self.restcapacity_of_nextcluster, penalty_formulation="Relaxation",label='weight_sum')
-        maxcoef = max(np.max(np.abs(coef_ang)), 1e-9)
+        capacity_constraints: ConstraintList = less_equal(
+            weight_sums,
+            self.restcapacity_of_nextcluster,
+            penalty_formulation="Relaxation",
+            label='weight_sum'
+        )
+        maxcoef = max(np.max(np.abs(coef)), 1e-9)
         penalty_scale = maxcoef * self.maxcapacity / self.restcapacity_of_nextcluster
         if p is not None:
             penalty_scale *= p
         capacity_constraints *= penalty_scale
-        model= Model(objective,capacity_constraints)
+        model = Model(objective, capacity_constraints)
 
-        result = solve(model,self.client)
+        result = solve(model, self.client)
         x_values = result.best.values
-       
         swap_perms = x.evaluate(x_values)
-        total_time= result.total_time.total_seconds()
+        total_time = result.total_time.total_seconds()
         execution_time = result.execution_time.total_seconds()
         response_time = result.response_time.total_seconds()
-        total_objective =result.best.objective
-        return  {
-                    "route": swap_perms,
-                    "total_time": total_time,
-                    "execution_time": execution_time,
-                    "response_time": response_time,
-                    "total_objective": total_objective,
-                    "n_city":n_mycluster
-                }
+        total_objective = result.best.objective
+        return {
+            "route": swap_perms,
+            "total_time": total_time,
+            "execution_time": execution_time,
+            "response_time": response_time,
+            "total_objective": total_objective,
+            "n_city": n_mycluster,
+            "stage2_mode": label,
+        }
+
+    def QA_processors_depot_angle(self, p: float = None):
+        cur_us = self._unit_vectors(self.cur_xs, self.cur_ys, self.depot_xy)
+        next_us = self._unit_vectors(self.next_xs, self.next_ys, self.depot_xy)
+        v_a = self._mean_direction(cur_us)
+        v_b = self._mean_direction(next_us)
+        coef_ang = np.dot(cur_us, v_a) - np.dot(cur_us, v_b)
+        return self._solve_with_linear_objective(coef_ang, p, label="depot_angle")
+
+    def QA_processors_centroid_angle(self, p: float = None):
+        mu_a = np.array([np.mean(self.cur_xs), np.mean(self.cur_ys)])
+        mu_b = np.array([np.mean(self.next_xs), np.mean(self.next_ys)])
+
+        u_i_a = self._unit_vectors(self.cur_xs, self.cur_ys, mu_a)
+        u_i_b = self._unit_vectors(self.cur_xs, self.cur_ys, mu_b)
+        v_a = self._mean_direction(u_i_a)
+        v_b = self._mean_direction(self._unit_vectors(self.next_xs, self.next_ys, mu_b))
+        coef_cent = np.dot(u_i_a, v_a) - np.dot(u_i_b, v_b)
+        return self._solve_with_linear_objective(coef_cent, p, label="centroid_angle")
+
+    def QA_processors(self, p: float = None):
+        """Backward compatibility: default to depot-angle objective."""
+        return self.QA_processors_depot_angle(p=p)
      
 
     def des_TSP(self, p, q):
