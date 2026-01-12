@@ -80,62 +80,84 @@ class knap_dippro:
     #         total_distance = calculate_total_distance(route, distance_matrix)
     #         print(f"Total distance for vehicle {vehicle}: {total_distance}")
 
-    def QA_processors(self, p: float = None):
+    def _unit_vectors(self, xs, ys, origin):
+        eps = 1e-12
+        dx = xs - origin[0]
+        dy = ys - origin[1]
+        norms = np.sqrt(dx * dx + dy * dy) + eps
+        return np.stack([dx / norms, dy / norms], axis=1)
+
+    def _mean_direction(self, us):
+        vec = np.sum(us, axis=0)
+        norm = np.linalg.norm(vec)
+        if norm < 1e-12:
+            return np.array([0.0, 0.0])
+        return vec / norm
+
+    def solve_stage2_reassignment(
+        self,
+        lam: float,
+        alpha: float = 1.0,
+        p: float | None = None,
+    ) -> dict:
         n_mycluster = len(self.demands)
         gen = VariableGenerator()
         x = gen.array("Binary", shape=(n_mycluster))
-        # print("x",x)
-        # print("demand",self.demands)
-        # 都市追加に関する目的関数（角度ベース）
-        eps = 1e-12
 
-        def _unit_vectors(xs, ys):
-            dx = xs - self.depot_xy[0]
-            dy = ys - self.depot_xy[1]
-            norms = np.sqrt(dx * dx + dy * dy) + eps
-            return np.stack([dx / norms, dy / norms], axis=1)
+        dist_diff = self.distances_from_nextcluster - self.distances_from_mycluster
+        dist_scale = float(np.max(np.abs(dist_diff))) + 1e-12
+        dist_norm = dist_diff / dist_scale
 
-        def _mean_direction(us):
-            vec = np.sum(us, axis=0)
-            norm = np.linalg.norm(vec)
-            if norm < 1e-12:
-                return np.array([0.0, 0.0])
-            return vec / norm
+        if self.depot_xy is None or self.cur_xs is None or self.cur_ys is None:
+            raise ValueError("depot_xy/cur_xs/cur_ys are required for stage2 angle objective.")
+        if self.next_xs is None or self.next_ys is None:
+            raise ValueError("next_xs/next_ys are required for stage2 angle objective.")
 
-        cur_us = _unit_vectors(self.cur_xs, self.cur_ys)
-        next_us = _unit_vectors(self.next_xs, self.next_ys)
-        v_a = _mean_direction(cur_us)
-        v_b = _mean_direction(next_us)
+        cur_us = self._unit_vectors(self.cur_xs, self.cur_ys, self.depot_xy)
+        next_us = self._unit_vectors(self.next_xs, self.next_ys, self.depot_xy)
+        v_a = self._mean_direction(cur_us)
+        v_b = self._mean_direction(next_us)
 
-        coef_ang = np.dot(cur_us, v_a) - np.dot(cur_us, v_b)
-        objective = einsum("i,i->", coef_ang, x)
+        ang_diff = np.dot(cur_us, v_a) - np.dot(cur_us, v_b)
+        ang_norm = ang_diff / 2.0
+
+        coef = dist_norm + lam * ang_norm
+        objective = einsum("i,i->", coef, x)
 
         demands = np.array(self.demands)
         weight_sums = einsum("i,i->", demands, x)
-        capacity_constraints: ConstraintList = less_equal(weight_sums, self.restcapacity_of_nextcluster, penalty_formulation="Relaxation",label='weight_sum')
-        maxcoef = max(np.max(np.abs(coef_ang)), 1e-9)
-        penalty_scale = maxcoef * self.maxcapacity / self.restcapacity_of_nextcluster
+        capacity_constraints: ConstraintList = less_equal(
+            weight_sums,
+            self.restcapacity_of_nextcluster,
+            penalty_formulation="Relaxation",
+            label='weight_sum'
+        )
+        cap_penalty = alpha * max(float(np.sum(np.abs(coef))), 1e-9)
         if p is not None:
-            penalty_scale *= p
-        capacity_constraints *= penalty_scale
-        model= Model(objective,capacity_constraints)
+            cap_penalty *= p
+        capacity_constraints *= cap_penalty
+        model = Model(objective, capacity_constraints)
 
-        result = solve(model,self.client)
+        result = solve(model, self.client)
         x_values = result.best.values
-       
+
         swap_perms = x.evaluate(x_values)
-        total_time= result.total_time.total_seconds()
+        total_time = result.total_time.total_seconds()
         execution_time = result.execution_time.total_seconds()
         response_time = result.response_time.total_seconds()
-        total_objective =result.best.objective
-        return  {
-                    "route": swap_perms,
-                    "total_time": total_time,
-                    "execution_time": execution_time,
-                    "response_time": response_time,
-                    "total_objective": total_objective,
-                    "n_city":n_mycluster
-                }
+        total_objective = result.best.objective
+        return {
+            "route": swap_perms,
+            "total_time": total_time,
+            "execution_time": execution_time,
+            "response_time": response_time,
+            "total_objective": total_objective,
+            "n_city": n_mycluster,
+        }
+
+    def QA_processors(self, p: float = None):
+        """Deprecated: use solve_stage2_reassignment instead."""
+        return self.solve_stage2_reassignment(lam=0.3, alpha=1.0, p=p)
      
 
     def des_TSP(self, p, q):

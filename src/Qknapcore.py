@@ -103,6 +103,8 @@ class Core:
         ap.add_argument("-nt",  help="QA solves per swap (num_solve)",       type=int, default=3)
         ap.add_argument("--p",  help="QA parameter p",                       type=float, default=1.0)
         ap.add_argument("--q",  help="QA parameter q",                       type=float, default=1.0)
+        ap.add_argument("--lam", help="Stage2 angle weight (lambda)",         type=float, default=0.3)
+        ap.add_argument("--alpha", help="Stage2 capacity penalty scale",      type=float, default=1.0)
         ap.add_argument("--max_iter", help="Max iterations",                 type=int, default=50)
         ap.add_argument(
             "--tsp_solver",
@@ -260,7 +262,11 @@ class Core:
                     next_xs=clusters_coordx[next_cluster_index],
                     next_ys=clusters_coordy[next_cluster_index],
                 )
-                pro_result = proccesor.QA_processors(p=args.p)
+                pro_result = proccesor.solve_stage2_reassignment(
+                    lam=args.lam,
+                    alpha=args.alpha,
+                    p=args.p,
+                )
 
                 # Normalize moved -> 0/1 mask
                 moved_arr = normalize_moved(pro_result.get("route", []), len(cur_ids))
