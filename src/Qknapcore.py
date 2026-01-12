@@ -270,7 +270,8 @@ class Core:
                 #     pro_result = proccesor.QA_processors_centroid_angle(p=args.p)
                 # else:
                 #     pro_result = proccesor.QA_processors_depot_angle(p=args.p)
-                pro_result = proccesor.QA_processors_centroid_angle(p=args.p)
+                pro_result = proccesor.QA_processors_depot_angle(p=args.p)
+                # pro_result = proccesor.QA_processors_centroid_angle(p=args.p)
                 # Normalize moved -> 0/1 mask
                 moved_arr = normalize_moved(pro_result.get("route", []), len(cur_ids))
                 did_move = bool(moved_arr.sum() > 0.5)
