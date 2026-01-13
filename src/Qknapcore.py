@@ -105,6 +105,12 @@ class Core:
         ap.add_argument("--q",  help="QA parameter q",                       type=float, default=1.0)
         ap.add_argument("--lam", help="Stage2 angle weight (lambda)",         type=float, default=0.3)
         ap.add_argument("--alpha", help="Stage2 capacity penalty scale",      type=float, default=1.0)
+        ap.add_argument(
+            "--stage2_mode",
+            choices=["dist", "dist+ang", "ang"],
+            default="dist+ang",
+            help="Stage2 objective mode",
+        )
         ap.add_argument("--max_iter", help="Max iterations",                 type=int, default=50)
         ap.add_argument(
             "--tsp_solver",
@@ -217,6 +223,7 @@ class Core:
                         "n_city":        int(len(clusters[current_cluster_index])),
                         "skipped":       True,
                         "skip_reason":   "no_remaining_capacity_in_next_cluster",
+                        "stage2_mode":   args.stage2_mode,
                         "sum_dist_current_before": None,
                         "sum_dist_current_after":  None,
                     }
@@ -266,6 +273,7 @@ class Core:
                     lam=args.lam,
                     alpha=args.alpha,
                     p=args.p,
+                    mode=args.stage2_mode,
                 )
 
                 # Normalize moved -> 0/1 mask
@@ -313,6 +321,7 @@ class Core:
                     "moved_indices": to_native(moved_arr),
                     "n_city":        int(n_city),
                     "skipped":       False,
+                    "stage2_mode":   args.stage2_mode,
                     "sum_dist_current_before": float(sum_before),
                     "sum_dist_current_after":  float(sum_after),
                 }

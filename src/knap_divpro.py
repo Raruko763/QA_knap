@@ -99,29 +99,42 @@ class knap_dippro:
         lam: float,
         alpha: float = 1.0,
         p: float | None = None,
+        mode: str = "dist+ang",
     ) -> dict:
         n_mycluster = len(self.demands)
         gen = VariableGenerator()
         x = gen.array("Binary", shape=(n_mycluster))
 
-        dist_diff = self.distances_from_nextcluster - self.distances_from_mycluster
-        dist_scale = float(np.max(np.abs(dist_diff))) + 1e-12
-        dist_norm = dist_diff / dist_scale
+        if mode not in {"dist", "dist+ang", "ang"}:
+            raise ValueError(f"Invalid mode: {mode}")
 
-        if self.depot_xy is None or self.cur_xs is None or self.cur_ys is None:
-            raise ValueError("depot_xy/cur_xs/cur_ys are required for stage2 angle objective.")
-        if self.next_xs is None or self.next_ys is None:
-            raise ValueError("next_xs/next_ys are required for stage2 angle objective.")
+        dist_norm = None
+        if mode in {"dist", "dist+ang"}:
+            dist_diff = self.distances_from_nextcluster.astype(float) - self.distances_from_mycluster.astype(float)
+            dist_scale = float(np.max(np.abs(dist_diff))) + 1e-12
+            dist_norm = dist_diff / dist_scale
 
-        cur_us = self._unit_vectors(self.cur_xs, self.cur_ys, self.depot_xy)
-        next_us = self._unit_vectors(self.next_xs, self.next_ys, self.depot_xy)
-        v_a = self._mean_direction(cur_us)
-        v_b = self._mean_direction(next_us)
+        ang_norm = None
+        if mode in {"ang", "dist+ang"}:
+            if self.depot_xy is None or self.cur_xs is None or self.cur_ys is None:
+                raise ValueError("depot_xy/cur_xs/cur_ys are required for stage2 angle objective.")
+            if self.next_xs is None or self.next_ys is None:
+                raise ValueError("next_xs/next_ys are required for stage2 angle objective.")
 
-        ang_diff = np.dot(cur_us, v_a) - np.dot(cur_us, v_b)
-        ang_norm = ang_diff / 2.0
+            cur_us = self._unit_vectors(self.cur_xs, self.cur_ys, self.depot_xy)
+            next_us = self._unit_vectors(self.next_xs, self.next_ys, self.depot_xy)
+            v_a = self._mean_direction(cur_us)
+            v_b = self._mean_direction(next_us)
 
-        coef = dist_norm + lam * ang_norm
+            ang_diff = np.dot(cur_us, v_a) - np.dot(cur_us, v_b)
+            ang_norm = ang_diff / 2.0
+
+        if mode == "dist":
+            coef = dist_norm
+        elif mode == "ang":
+            coef = ang_norm
+        else:
+            coef = dist_norm + lam * ang_norm
         objective = einsum("i,i->", coef, x)
 
         demands = np.array(self.demands)
@@ -153,6 +166,10 @@ class knap_dippro:
             "response_time": response_time,
             "total_objective": total_objective,
             "n_city": n_mycluster,
+            "mode": mode,
+            "lam": lam,
+            "alpha": alpha,
+            "p": p,
         }
 
     def QA_processors(self, p: float = None):
