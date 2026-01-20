@@ -216,6 +216,10 @@ class Core:
                         "swap_index":    int(idx),
                         "from_cluster":  int(current_cluster_index),
                         "to_cluster":    int(next_cluster_index),
+                        "restcapacity":  float(restcapacity),
+                        "selected_weight": 0.0,
+                        "violation":     0.0,
+                        "moved_city_ids": [],
                         "qa_ms":         0.0,
                         "move_ms":       0.0,
                         "block_ms":      0.0,
@@ -224,6 +228,10 @@ class Core:
                         "skipped":       True,
                         "skip_reason":   "no_remaining_capacity_in_next_cluster",
                         "stage2_mode":   args.stage2_mode,
+                        "lam":           float(args.lam),
+                        "alpha":         float(args.alpha),
+                        "p":             float(args.p),
+                        "total_objective": None,
                         "sum_dist_current_before": None,
                         "sum_dist_current_after":  None,
                     }
@@ -282,6 +290,11 @@ class Core:
                 if did_move:
                     moved_total += 1
 
+                demand_vec = np.asarray(demand_current, dtype=float)
+                selected_weight = float(np.dot(demand_vec, moved_arr))
+                violation = max(0.0, selected_weight - float(restcapacity))
+                moved_city_ids = [int(cur_ids[i]) for i in np.where(moved_arr > 0.5)[0]]
+
                 # Timing
                 t_block_end = time.perf_counter()
                 block_ms = float((t_block_end - t_block_start) * 1000.0)
@@ -315,6 +328,10 @@ class Core:
                     "swap_index":    int(idx),
                     "from_cluster":  int(current_cluster_index),
                     "to_cluster":    int(next_cluster_index),
+                    "restcapacity":  float(restcapacity),
+                    "selected_weight": float(selected_weight),
+                    "violation":     float(violation),
+                    "moved_city_ids": moved_city_ids,
                     "qa_ms":         float(qa_ms),
                     "move_ms":       float(move_ms),
                     "block_ms":      float(block_ms),
@@ -322,6 +339,10 @@ class Core:
                     "n_city":        int(n_city),
                     "skipped":       False,
                     "stage2_mode":   args.stage2_mode,
+                    "lam":           float(args.lam),
+                    "alpha":         float(args.alpha),
+                    "p":             float(args.p),
+                    "total_objective": to_native(pro_result.get("total_objective")),
                     "sum_dist_current_before": float(sum_before),
                     "sum_dist_current_after":  float(sum_after),
                 }
