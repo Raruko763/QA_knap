@@ -1,28 +1,20 @@
 #!/bin/zsh
 # =====================================================
-# test_sweep_vrp.zsh
+# test_sweep.zsh
 # - data/raw/*.vrp を Sweep-only + Concorde で一括テスト
-# - test_sweep.py を呼び出す
+# - src.test_sweep を module 実行する（import安定）
 # =====================================================
 
 set -euo pipefail
 
-# ---------- 設定 ----------
-# .vrp が置いてあるディレクトリ
 RAW_DIR="./data/raw"
-
-# 出力先（timestamp/instance_sweep_only が作られる）
 OUT_BASE="./out/test_sweep"
-
-# Sweep + Concorde core
-CORE_SWEEP_VRP="./src/test_sweep.py"
-
-# Sweep 開始角（rad）
 START_ANGLE=0.0
 
-# Concorde 設定（必要なら調整）
-# export CONCORDE_BIN="/path/to/concorde"
-CONCORDE_SEED=1
+# Concorde 設定
+# CONCORDE_SEED=1
+export CONCORDE_BIN="/home/toshiya1048/tools/concorde/TSP/concorde"
+
 
 # ---------- 事前チェック ----------
 if [[ ! -d "$RAW_DIR" ]]; then
@@ -30,20 +22,19 @@ if [[ ! -d "$RAW_DIR" ]]; then
   exit 1
 fi
 
-if [[ ! -f "$CORE_SWEEP_VRP" ]]; then
-  echo "❌ test_sweep.py not found: $CORE_SWEEP_VRP" >&2
-  exit 1
-fi
-
 mkdir -p "$OUT_BASE"
+
+# src をパッケージとして扱えるように（無ければ作る）
+if [[ ! -f "src/__init__.py" ]]; then
+  touch src/__init__.py
+fi
 
 echo "============================================="
 echo "Sweep + Concorde VRP batch test"
 echo "RAW_DIR      : $RAW_DIR"
 echo "OUT_BASE     : $OUT_BASE"
-echo "CORE_SWEEP   : $CORE_SWEEP_VRP"
 echo "START_ANGLE : $START_ANGLE (rad)"
-echo "CONCORDE_SEED: $CONCORDE_SEED"
+# echo "CONCORDE_SEED: $CONCORDE_SEED"
 echo "============================================="
 
 # ---------- 実行 ----------
@@ -54,18 +45,12 @@ for vrp in "$RAW_DIR"/*.vrp; do
   echo "🚚 Instance: $name"
   echo "---------------------------------------------"
 
-  # ❗ Python 側で
-  #   - node_coord 無し
-  #   - MemoryError
-  #   - Concorde 失敗
-  # を全部 catch して skip するので zsh は止まらない
-  python3 "$CORE_SWEEP_VRP" \
+  python3 -m src.test_sweep \
     -i "$vrp" \
     -sp "$OUT_BASE" \
     --start_angle "$START_ANGLE" \
     --solve_tsp \
-    --seed "$CONCORDE_SEED" || echo "⚠️ skipped: $name"
-
+    # --seed "$CONCORDE_SEED" || echo "⚠️ skipped: $name"
 done
 
 echo ""

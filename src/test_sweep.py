@@ -3,18 +3,19 @@
 """
 test_sweep.py
 - .vrp を vrplib で読む
-- Sweepでクラスタ作る
-- （任意）Concordeで各クラスタのTSPを解く
-- node_coord無し / MemoryError などはスキップ（バッチが止まらない）
+- Sweepでクラスタ作る（前処理）
+- （任意）Concordeで各クラスタのTSPを解く（depot込み）
+- 前処理時間 / Concorde時間 / 全体時間 を JSON に保存
+- node_coord無し / MemoryError 等はスキップ（バッチが止まらない）
 """
 
-import os
 import json
 import math
+import time
 import argparse
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import vrplib
@@ -157,17 +158,15 @@ def sweep_clusters(
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Sweep-only baseline runner (input .vrp)")
+    ap = argparse.ArgumentParser(description="Sweep preprocessing + Concorde TSP (input .vrp)")
     ap.add_argument("-i", "--input_vrp", required=True, type=str, help="Path to .vrp (e.g. data/raw/E-n101-k14.vrp)")
-    ap.add_argument("-sp", required=True, type=str, help="Base output directory (e.g. ./out_sweep)")
+    ap.add_argument("-sp", required=True, type=str, help="Base output directory (e.g. ./out/test_sweep)")
     ap.add_argument("--start_angle", type=float, default=0.0, help="Sweep start angle (rad)")
 
-    # Concorde TSP
+    # Concorde
     ap.add_argument("--solve_tsp", action="store_true", help="Solve per-cluster TSP with Concorde")
     ap.add_argument("--concorde_work", type=str, default="", help="Work dir for Concorde (default: <save_dir>/concorde_work)")
     ap.add_argument("--concorde_bin", type=str, default="", help="Path to concorde binary (or set CONCORDE_BIN env)")
-    ap.add_argument("--seed", type=int, default=0, help="Concorde seed (0 disables -s)")
-
     args = ap.parse_args()
 
     base_out = Path(args.sp)
@@ -176,6 +175,9 @@ def main():
 
     vrp_path = Path(args.input_vrp).resolve()
     instance_name = vrp_path.stem
+
+    # wall time (total)
+    t_all0 = time.perf_counter()
 
     try:
         if not vrp_path.exists():
@@ -190,7 +192,8 @@ def main():
         depot_x, depot_y = info["depot"]
         capacity = info["capacity"]
 
-        # ---- sweep ----
+        # ---- sweep time ----
+        t_sweep0 = time.perf_counter()
         res = sweep_clusters(
             city_ids=info["city_ids"],
             xs=info["xs"],
@@ -201,6 +204,8 @@ def main():
             depot_y=depot_y,
             start_angle=float(args.start_angle),
         )
+        t_sweep1 = time.perf_counter()
+        sweep_time_ms = (t_sweep1 - t_sweep0) * 1000
 
         clusters = res["clusters"]
         clusters_coordx = res["clusters_coordx"]
@@ -218,18 +223,22 @@ def main():
             "cluster_demands_sum": [float(sum(ds)) for ds in cluster_demands],
             "clusters": clusters,  # global city ids (1..n)
             "centroids": res["centroids"],
+            "time_sweep_ms": int(sweep_time_ms),
         }
 
         # ---- (optional) Concorde per-cluster TSP ----
+        concorde_time_ms_sum = 0
+        concorde_time_ms_max = 0
+
         if args.solve_tsp:
             work_dir = args.concorde_work.strip() or str(save_dir / "concorde_work")
-            seed = None if args.seed == 0 else int(args.seed)
             concorde_bin = args.concorde_bin.strip() or None
 
             tsp_routes = []
             total_distance = 0
 
             for cluster_id, (xs_i, ys_i, cities_i) in enumerate(zip(clusters_coordx, clusters_coordy, clusters)):
+                # depot(0) + customers
                 coordx = [depot_x] + xs_i
                 coordy = [depot_y] + ys_i
                 dist = vrpfactory.make_cluster_distance_matrix(coordx, coordy)
@@ -237,14 +246,16 @@ def main():
                 cres = solve_tsp_concorde(
                     dist_matrix=dist,
                     work_dir=work_dir,
-                    seed=seed,
                     concorde_bin=concorde_bin,
                 )
 
                 route_local = cres.get("route")
                 td = cres.get("total_distance")
                 status = cres.get("solver_status")
-                solve_time_ms = cres.get("solve_time_ms")
+                solve_time_ms = int(cres.get("solve_time_ms") or 0)
+
+                concorde_time_ms_sum += solve_time_ms
+                concorde_time_ms_max = max(concorde_time_ms_max, solve_time_ms)
 
                 if route_local is None:
                     tsp_routes.append({
@@ -255,9 +266,15 @@ def main():
                         "total_distance": None,
                         "route_local": None,
                         "route_global": None,
+                        # debug
+                        "tsp_file": cres.get("tsp_file"),
+                        "tour_file": cres.get("tour_file"),
+                        "raw_stdout": cres.get("raw_stdout"),
+                        "raw_stderr": cres.get("raw_stderr"),
                     })
                     continue
 
+                # local -> global
                 route_global = []
                 for node in route_local:
                     if node == 0:
@@ -273,7 +290,7 @@ def main():
                     "solver": "concorde",
                     "solver_status": status,
                     "solve_time_ms": solve_time_ms,
-                    "total_distance": td,
+                    "total_distance": int(td) if td is not None else None,
                     "route_local": route_local,
                     "route_global": route_global,
                 })
@@ -281,6 +298,12 @@ def main():
             payload["tsp_solver"] = "concorde"
             payload["tsp_total_distance"] = int(total_distance)
             payload["tsp_routes"] = tsp_routes
+            payload["time_concorde_ms_sum"] = concorde_time_ms_sum
+            payload["time_concorde_ms_max"] = concorde_time_ms_max
+
+        # ---- total wall time ----
+        t_all1 = time.perf_counter()
+        payload["time_total_ms"] = (t_all1 - t_all0) * 1000
 
         out_path = save_dir / "sweep_only.json"
         with out_path.open("w") as f:
