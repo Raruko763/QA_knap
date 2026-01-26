@@ -280,28 +280,27 @@ class vrpfactory:
         return cities,distance_matrix,demand,capacity,nvheicle,x_coord,y_coord
 
 
-        
     def makedata(file_name):
+        nodes = vrplib.read_instance(file_name)
 
-        nodes = vrplib.read_instance(f"{file_name}")
-        nvehicle = 3
         distance_matrix = nodes['edge_weight']
-        # if (nodes['node_coord'] != None):
-        #     coord = nodes['node_coord']
-       
-        demand = nodes['demand'][1:]
+        demand = nodes['demand'][1:]          # depot除外
         capacity = nodes['capacity']
-       
-        x_coord = []
-        y_coord = []
-        # for i in range(len(coord)):
-        #     x = nodes['node_coord'][i][0]
-        #     x_coord.append(x)
-        #     y = nodes['node_coord'][i][1]
-        #     y_coord.append(y)
-        # print(distance_matrix)
-        return distance_matrix,demand,capacity,nvehicle,x_coord,y_coord
 
+        coord = nodes.get('node_coord')
+        if coord is None:
+            raise ValueError("This .vrp has no node_coord. Sweep needs coordinates.")
+
+        # coord は depot を含む (0..n) が普通
+        x_coord = [float(coord[i][0]) for i in range(len(coord))]
+        y_coord = [float(coord[i][1]) for i in range(len(coord))]
+
+        # nvehicle は .vrp の情報から取れないことが多いのでダミー or None にする
+        nvehicle = None
+
+        return distance_matrix, np.array(demand, dtype=float), float(capacity), nvehicle, x_coord, y_coord
+
+    
     @staticmethod
     def distance(x1, y1, x2, y2):
         """distance: euclidean distance between (x1,y1) and (x2,y2)"""
