@@ -9,13 +9,13 @@ set -euo pipefail
 
 # ---------- 設定 ----------
 # .vrp が置いてあるディレクトリ
-RAW_DIR="./../data/raw"
+RAW_DIR="./data/raw"
 
 # 出力先（timestamp/instance_sweep_only が作られる）
-OUT_BASE="./../out/test_sweep"
+OUT_BASE="./out/test_sweep"
 
 # Sweep-only core
-CORE_SWEEP_VRP="./../src/test_sweep.py"
+CORE_SWEEP_VRP="./src/test_sweep.py"
 
 # Sweep 開始角（rad）
 START_ANGLE=0.0
