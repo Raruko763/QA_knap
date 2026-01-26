@@ -2,46 +2,22 @@
 # =====================================================
 # test_sweep_vrp.zsh
 # - data/raw/*.vrp を Sweep-only で一括テスト
-# - core_sweep_vrp.py を呼び出す
+# - Pythonが落ちても止めずに次へ（skip）
 # =====================================================
 
-set -euo pipefail
+set -u  # -e は使わない（落ちたら止まるので）
 
-# ---------- 設定 ----------
-# .vrp が置いてあるディレクトリ
 RAW_DIR="./data/raw"
-
-# 出力先（timestamp/instance_sweep_only が作られる）
 OUT_BASE="./out/test_sweep"
-
-# Sweep-only core
 CORE_SWEEP_VRP="./src/test_sweep.py"
-
-# Sweep 開始角（rad）
 START_ANGLE=0.0
 
-# ---------- 事前チェック ----------
-if [[ ! -d "$RAW_DIR" ]]; then
-  echo "❌ RAW_DIR not found: $RAW_DIR" >&2
-  exit 1
-fi
-
-if [[ ! -f "$CORE_SWEEP_VRP" ]]; then
-  echo "❌ core_sweep_vrp.py not found: $CORE_SWEEP_VRP" >&2
-  exit 1
-fi
-
 mkdir -p "$OUT_BASE"
+SKIP_LOG="$OUT_BASE/skipped.log"
+ERR_LOG="$OUT_BASE/errors.log"
 
-echo "============================================="
-echo "Sweep-only VRP batch test"
-echo "RAW_DIR      : $RAW_DIR"
-echo "OUT_BASE     : $OUT_BASE"
-echo "CORE_SWEEP   : $CORE_SWEEP_VRP"
-echo "START_ANGLE : $START_ANGLE (rad)"
-echo "============================================="
+echo "Sweep-only batch start: $(date)" | tee -a "$ERR_LOG"
 
-# ---------- 実行 ----------
 for vrp in "$RAW_DIR"/*.vrp; do
   name=$(basename "$vrp")
   echo ""
@@ -49,12 +25,24 @@ for vrp in "$RAW_DIR"/*.vrp; do
   echo "🚚 Instance: $name"
   echo "---------------------------------------------"
 
+  # Python実行（stdout/stderrは両方ログにも残す）
   python3 "$CORE_SWEEP_VRP" \
     -i "$vrp" \
     -sp "$OUT_BASE" \
-    --start_angle "$START_ANGLE"
+    --start_angle "$START_ANGLE" \
+    >> "$ERR_LOG" 2>&1
+
+  rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "SKIP $name (exit=$rc)" | tee -a "$SKIP_LOG"
+    echo "---- error tail ($name) ----" >> "$SKIP_LOG"
+    tail -n 5 "$ERR_LOG" >> "$SKIP_LOG"
+    echo "----------------------------" >> "$SKIP_LOG"
+    continue
+  fi
 done
 
 echo ""
-echo "✅ All Sweep-only VRP tests finished."
-echo "📂 Results saved under: $OUT_BASE"
+echo "✅ Finished. Results: $OUT_BASE"
+echo "📝 Skip log: $SKIP_LOG"
+echo "📝 Error log: $ERR_LOG"
