@@ -2,19 +2,31 @@
 # -*- coding: utf-8 -*-
 """
 driver_sweep_qubo.py
+
 Flow:
   1) load .vrp (vrplib)
-  2) Sweep initial clustering (capacity-feasible) + time_sweep
-  3) Build centroid graph + perms (Concorde TSP on centroids)
-  4) Run existing QUBO iteration (knap_dippro + process_swap)
-  5) Solve final per-cluster TSP (Concorde) for total route length + time_routing
+  2) Sweep initial clustering (capacity-feasible) + time_sweep_ms
+  3) Build centroid graph + perms (Concorde TSP on centroids) + time_perms_ms
+  4) Evaluate (Concorde) on clusters -> iteration_0.json  (your expected format)
+  5) Run QUBO iteration (knap_dippro + process_swap)
+     After each iteration, evaluate (Concorde) -> iteration_k.json
+  6) Save final_summary.json
 
-Notes:
-- No routing is computed right after Sweep (only clustering + centroid perms).
-- All timings are stored as float milliseconds (not int).
+Outputs under:
+  out/<timestamp>/<instance>_sweep_qubo/
+    sweep_init.json
+    centroid_perms.json
+    iteration_0.json
+    iteration_0_meta.json
+    iteration_1_swap.json
+    iteration_1.json
+    iteration_1_meta.json
+    ...
+    final_summary.json
 """
 
 import os
+import sys
 import re
 import json
 import math
@@ -27,7 +39,10 @@ from typing import Any, Dict, List, Tuple, Optional
 import numpy as np
 import vrplib
 
-from amplify import FixstarsClient
+try:
+    from amplify import FixstarsClient
+except Exception as e:
+    raise RuntimeError("Failed to import 'amplify'. Install Fixstars Amplify SDK.") from e
 
 from src.vrpfactory import vrpfactory
 from src.knap_divpro import knap_dippro
@@ -49,6 +64,17 @@ def ms(t0: float, t1: float) -> float:
     return (t1 - t0) * 1000.0
 
 
+def rotate_route_to_start(route: List[int], start_node: int = 0) -> List[int]:
+    """Rotate a Hamiltonian cycle representation so that it starts with start_node."""
+    if not route:
+        return route
+    try:
+        k = route.index(start_node)
+    except ValueError:
+        return route
+    return route[k:] + route[:k]
+
+
 def centroid(xs: List[float], ys: List[float]) -> Tuple[float, float]:
     if not xs:
         return 0.0, 0.0
@@ -68,6 +94,27 @@ def make_dist_matrix_from_points(xs: List[float], ys: List[float]) -> np.ndarray
     return D
 
 
+def normalize_moved(raw, length: int) -> np.ndarray:
+    """
+    Normalize 'moved' to a 0/1 mask of length 'length'.
+    Accepts either a 0/1 vector or an index list.
+    """
+    arr = np.array(raw)
+    # already 0/1 vector
+    if arr.ndim == 1 and arr.size == length and np.isin(arr, [0, 1, 0.0, 1.0]).all():
+        return arr.astype(float)
+    # treat as indices
+    mask = np.zeros(length, dtype=float)
+    try:
+        idx_ = arr.astype(int)
+        idx_ = idx_[(idx_ >= 0) & (idx_ < length)]
+        mask[idx_] = 1.0
+    except Exception:
+        pass
+    return mask
+
+
+# ---------- VRP loader ----------
 def load_vrp_instance(vrp_path: str) -> Dict[str, Any]:
     """
     Read .vrp via vrplib.
@@ -107,6 +154,7 @@ def load_vrp_instance(vrp_path: str) -> Dict[str, Any]:
     }
 
 
+# ---------- Sweep clustering ----------
 def sweep_capacity_split(
     city_ids: List[int],
     xs: List[float],
@@ -182,21 +230,86 @@ def sweep_capacity_split(
     }
 
 
-def build_cluster_distance_matrices(
-    depot_x: float, depot_y: float,
+# ---------- Evaluation: Concorde per-cluster TSP ----------
+def eval_clusters_concorde(
+    depot_x: float,
+    depot_y: float,
+    clusters: List[List[int]],
     clusters_coordx: List[List[float]],
     clusters_coordy: List[List[float]],
-) -> List[np.ndarray]:
-    mats = []
-    for xs_i, ys_i in zip(clusters_coordx, clusters_coordy):
+    work_dir: Path,
+    concorde_bin: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], int, float]:
+    """
+    Returns:
+      routes_list: list of dicts (your expected iteration_k.json format)
+      total_sum: sum of total_distance over SUCCESS clusters
+      eval_time_ms: wall time for evaluating all clusters
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    t0 = time.perf_counter()
+    routes: List[Dict[str, Any]] = []
+    total_sum = 0
+
+    for cluster_id, (cities_i, xs_i, ys_i) in enumerate(zip(clusters, clusters_coordx, clusters_coordy)):
         coordx = [depot_x] + xs_i
         coordy = [depot_y] + ys_i
-        mats.append(vrpfactory.make_cluster_distance_matrix(coordx, coordy))
-    return mats
+        D = vrpfactory.make_cluster_distance_matrix(coordx, coordy)
+
+        cres = solve_tsp_concorde(
+            dist_matrix=D,
+            work_dir=str(work_dir),
+            concorde_bin=concorde_bin,
+        )
+
+        status = cres.get("solver_status")
+        solve_time_ms = cres.get("solve_time_ms")
+
+        route_local = cres.get("route")
+        if route_local is not None:
+            route_local = rotate_route_to_start([int(v) for v in route_local], start_node=0)
+
+        td = cres.get("total_distance")
+        if isinstance(td, (int, float)) and status == "SUCCESS":
+            td_int = int(td)
+            total_sum += td_int
+        else:
+            td_int = None
+
+        route_global = None
+        if route_local is not None:
+            route_global = []
+            for node in route_local:
+                if node == 0:
+                    route_global.append(0)
+                else:
+                    # node is local index in [1..len(cities_i)]
+                    route_global.append(int(cities_i[node - 1]))
+
+        routes.append({
+            "cluster_id": int(cluster_id),
+            "route_local": route_local,
+            "route_global": route_global,
+            "total_distance": td_int,
+            "solver": "concorde",
+            "solver_status": status,
+            "solve_time_ms": solve_time_ms,
+            # keep debug/consistency fields if solver provides them
+            "optimal_value_stdout": cres.get("optimal_value_stdout"),
+            "cost_from_stdout": cres.get("cost_from_stdout"),
+            "cost_from_route": cres.get("cost_from_route"),
+            "cost_diff": cres.get("cost_diff"),
+        })
+
+    t1 = time.perf_counter()
+    return routes, int(total_sum), ms(t0, t1)
 
 
+# ---------- main ----------
 def main():
-    ap = argparse.ArgumentParser(description="Sweep init + QUBO iteration + routing driver")
+    ap = argparse.ArgumentParser(description="Sweep init + perms + QUBO iteration + Concorde evaluation each iteration")
+
     ap.add_argument("-i", "--input_vrp", required=True, type=str, help="Path to .vrp")
     ap.add_argument("-sp", required=True, type=str, help="Base output directory")
     ap.add_argument("--start_angle", type=float, default=0.0, help="Sweep start angle (rad)")
@@ -211,9 +324,8 @@ def main():
     ap.add_argument("--stage2_mode", choices=["dist", "dist+ang", "ang"], default="dist+ang")
     ap.add_argument("--max_iter", type=int, default=50)
 
-    # routing (final evaluation only)
-    ap.add_argument("--routing", action="store_true", help="Solve final per-cluster TSP (Concorde) to get total distance")
-    ap.add_argument("--concorde_bin", type=str, default="", help="Path to concorde binary (or set CONCORDE_BIN)")
+    # Concorde
+    ap.add_argument("--concorde_bin", type=str, default="", help="Path to concorde binary (or set CONCORDE_BIN env)")
 
     args = ap.parse_args()
 
@@ -237,7 +349,11 @@ def main():
         token = os.environ.get("AMPLIFY_TOKEN")
         if token:
             client.token = token
-        client.parameters.timeout = args.anneal_ms  # ms (Amplify expects ms timedelta in other code; keep consistent if needed)
+
+        # IMPORTANT: your other code uses timedelta(milliseconds=...)
+        # Here we follow that style:
+        from datetime import timedelta
+        client.parameters.timeout = timedelta(milliseconds=int(args.anneal_ms))
 
         # ---- load vrp ----
         info = load_vrp_instance(str(vrp_path))
@@ -268,10 +384,7 @@ def main():
         gra_clusters_coordy = sweep_out["gra_clusters_coordy"]
         gra_distances = np.array(sweep_out["gra_distances"], dtype=float)
 
-        # initial cluster distance matrices (for later updates)
-        distances = build_cluster_distance_matrices(depot_x, depot_y, clusters_coordx, clusters_coordy)
-
-        # save sweep init (NO routing here)
+        # save sweep init (NO routing cost here)
         sweep_init_path = save_dir / "sweep_init.json"
         with sweep_init_path.open("w") as f:
             json.dump({
@@ -280,19 +393,19 @@ def main():
                 "depot": {"x": depot_x, "y": depot_y},
                 "capacity": capacity,
                 "start_angle_rad": float(args.start_angle),
-                "K": len(clusters),
-                "cluster_sizes": [len(c) for c in clusters],
+                "K": int(len(clusters)),
+                "cluster_sizes": [int(len(c)) for c in clusters],
                 "cluster_demands_sum": [float(sum(ds)) for ds in cluster_demands],
                 "time_sweep_ms": float(time_sweep_ms),
             }, f, indent=2, default=to_native)
-
+        print("前処理終了")
         # ---- (2) perms by centroid TSP (Concorde) ----
-        # NOTE: this is NOT VRP route evaluation; it's just adjacency order for iteration.
+        # this is for adjacency order, not VRP evaluation
         t2 = time.perf_counter()
-        work_dir = save_dir / "centroid_tsp_work"
+        centroid_work_dir = save_dir / "centroid_tsp_work"
         cres = solve_tsp_concorde(
             dist_matrix=gra_distances,
-            work_dir=str(work_dir),
+            work_dir=str(centroid_work_dir),
             concorde_bin=(args.concorde_bin.strip() or None),
         )
         t3 = time.perf_counter()
@@ -301,20 +414,42 @@ def main():
         if cres.get("route") is None:
             raise RuntimeError(f"Centroid TSP failed: {cres.get('solver_status')}")
 
-        # route is a permutation of 0..K-1. Use it directly as perms.
         perms = [int(v) for v in cres["route"]]
+        perms = rotate_route_to_start(perms, start_node=0)
+
         centroid_perms_path = save_dir / "centroid_perms.json"
         with centroid_perms_path.open("w") as f:
             json.dump({
                 "instance": instance_name,
-                "K": len(clusters),
+                "K": int(len(clusters)),
                 "perms": perms,
                 "time_perms_ms": float(time_perms_ms),
                 "centroid_tsp_status": cres.get("solver_status"),
                 "centroid_tsp_cost": cres.get("total_distance"),
             }, f, indent=2, default=to_native)
 
-        # ---- (3) iteration (reuse your core logic style) ----
+        # ---- (2.5) evaluation right after sweep => iteration_0.json ----
+        it0_work = save_dir / "concorde_work_iter_0"
+        routes0, total0, eval0_ms = eval_clusters_concorde(
+            depot_x=depot_x,
+            depot_y=depot_y,
+            clusters=clusters,
+            clusters_coordx=clusters_coordx,
+            clusters_coordy=clusters_coordy,
+            work_dir=it0_work,
+            concorde_bin=(args.concorde_bin.strip() or None),
+        )
+        with (save_dir / "iteration_0.json").open("w") as f:
+            json.dump(routes0, f, indent=2, default=to_native)
+        with (save_dir / "iteration_0_meta.json").open("w") as f:
+            json.dump({
+                "iteration": 0,
+                "total_distance": int(total0),
+                "eval_time_ms": float(eval0_ms),
+                "K": int(len(clusters)),
+            }, f, indent=2, default=to_native)
+
+        # ---- (3) iteration ----
         t_iter0 = time.perf_counter()
 
         iteration = 0
@@ -326,6 +461,7 @@ def main():
             for idx, current_cluster_index in enumerate(perms):
                 next_cluster_index = perms[(idx + 1) % len(perms)]
 
+                # remaining capacity in next cluster
                 restcapacity = float(capacity - sum(cluster_demands[next_cluster_index]))
                 if restcapacity <= 0:
                     swap_time_log.append({
@@ -333,6 +469,7 @@ def main():
                         "swap_index": idx,
                         "from_cluster": int(current_cluster_index),
                         "to_cluster": int(next_cluster_index),
+                        "restcapacity": restcapacity,
                         "skipped": True,
                         "skip_reason": "no_remaining_capacity_in_next_cluster",
                     })
@@ -346,7 +483,7 @@ def main():
                 cur_cx = gra_clusters_coordx[current_cluster_index]
                 cur_cy = gra_clusters_coordy[current_cluster_index]
 
-                # distance vectors to current centroid and next centroid
+                # distance vectors
                 dist_vec_before = vrpfactory.make_distances(cur_xs, cur_ys, cur_cx, cur_cy)
                 next_cx = gra_clusters_coordx[next_cluster_index]
                 next_cy = gra_clusters_coordy[next_cluster_index]
@@ -354,7 +491,7 @@ def main():
 
                 demand_current = cluster_demands[current_cluster_index]
 
-                # QUBO solve (stage2 reassignment)
+                # QUBO solve
                 proc = knap_dippro(
                     client,
                     dist_vec_before,
@@ -378,31 +515,20 @@ def main():
                     mode=args.stage2_mode,
                 )
 
-                moved_raw = pro_result.get("route", [])
-                moved_arr = np.array(moved_raw, dtype=float)
-
-                # normalize moved_arr: accept either 0/1 vector or indices
-                if not (moved_arr.ndim == 1 and moved_arr.size == len(cur_ids) and np.isin(moved_arr, [0, 1, 0.0, 1.0]).all()):
-                    mask = np.zeros(len(cur_ids), dtype=float)
-                    try:
-                        idxs = np.array(moved_raw, dtype=int)
-                        idxs = idxs[(idxs >= 0) & (idxs < len(cur_ids))]
-                        mask[idxs] = 1.0
-                    except Exception:
-                        pass
-                    moved_arr = mask
-
+                moved_arr = normalize_moved(pro_result.get("route", []), len(cur_ids))
                 did_move = bool(moved_arr.sum() > 0.5)
                 if did_move:
                     moved_total += 1
+
+                    # apply swap
                     (
                         clusters, clusters_coordx, clusters_coordy, cluster_demands,
-                        gra_clusters_coordx, gra_clusters_coordy, distances
+                        gra_clusters_coordx, gra_clusters_coordy, _distances_dummy
                     ) = vrpfactory.process_swap(
                         moved_arr,
                         clusters, clusters_coordx, clusters_coordy, cluster_demands,
                         gra_clusters_coordx, gra_clusters_coordy,
-                        current_cluster_index, next_cluster_index, distances
+                        current_cluster_index, next_cluster_index, distances=[None]*len(clusters)  # distances unused here
                     )
 
                 t_block1 = time.perf_counter()
@@ -412,15 +538,39 @@ def main():
                     "swap_index": idx,
                     "from_cluster": int(current_cluster_index),
                     "to_cluster": int(next_cluster_index),
+                    "restcapacity": float(restcapacity),
                     "did_move": did_move,
-                    "block_ms": float(ms(t_block0, t_block1)),
                     "moved_count": int(moved_arr.sum()),
+                    "block_ms": float(ms(t_block0, t_block1)),
                 })
 
-            # save per-iteration swap log
+            # save swap log
             with (save_dir / f"iteration_{iteration}_swap.json").open("w") as f:
                 json.dump(swap_time_log, f, indent=2, default=to_native)
 
+            # ---- evaluate after this iteration => iteration_k.json ----
+            it_work = save_dir / f"concorde_work_iter_{iteration}"
+            routes_k, total_k, eval_k_ms = eval_clusters_concorde(
+                depot_x=depot_x,
+                depot_y=depot_y,
+                clusters=clusters,
+                clusters_coordx=clusters_coordx,
+                clusters_coordy=clusters_coordy,
+                work_dir=it_work,
+                concorde_bin=(args.concorde_bin.strip() or None),
+            )
+            with (save_dir / f"iteration_{iteration}.json").open("w") as f:
+                json.dump(routes_k, f, indent=2, default=to_native)
+            with (save_dir / f"iteration_{iteration}_meta.json").open("w") as f:
+                json.dump({
+                    "iteration": int(iteration),
+                    "total_distance": int(total_k),
+                    "eval_time_ms": float(eval_k_ms),
+                    "K": int(len(clusters)),
+                    "moved_total": int(moved_total),
+                }, f, indent=2, default=to_native)
+
+            # stop
             if moved_total == 0:
                 break
             if iteration >= args.max_iter:
@@ -429,79 +579,39 @@ def main():
         t_iter1 = time.perf_counter()
         time_iteration_ms = ms(t_iter0, t_iter1)
 
-        # ---- (4) routing (final evaluation only) ----
-        routing_payload = None
-        time_routing_ms = None
-        total_distance = None
-
-        if args.routing:
-            t_r0 = time.perf_counter()
-            work_dir = save_dir / "concorde_work_final"
-            routes = []
-            total = 0
-            for cluster_id, (xs_i, ys_i, cities_i) in enumerate(zip(clusters_coordx, clusters_coordy, clusters)):
-                coordx = [depot_x] + xs_i
-                coordy = [depot_y] + ys_i
-                D = vrpfactory.make_cluster_distance_matrix(coordx, coordy)
-                res = solve_tsp_concorde(D, work_dir=str(work_dir), concorde_bin=(args.concorde_bin.strip() or None))
-                if res.get("route") is None:
-                    routes.append({
-                        "cluster_id": cluster_id,
-                        "solver_status": res.get("solver_status"),
-                        "total_distance": None,
-                    })
-                    continue
-                route_local = res["route"]
-                route_global = [0 if v == 0 else int(cities_i[v - 1]) for v in route_local]
-                td = int(res.get("total_distance"))
-                total += td
-                routes.append({
-                    "cluster_id": cluster_id,
-                    "solver_status": res.get("solver_status"),
-                    "total_distance": td,
-                    "route_local": route_local,
-                    "route_global": route_global,
-                })
-            t_r1 = time.perf_counter()
-            time_routing_ms = ms(t_r0, t_r1)
-            total_distance = int(total)
-            routing_payload = routes
-
-            with (save_dir / "final_routes.json").open("w") as f:
-                json.dump(routing_payload, f, indent=2, default=to_native)
-
-        # ---- summary ----
+        # ---- final summary ----
         t_all1 = time.perf_counter()
-        summary = {
+        final_summary = {
             "instance": instance_name,
             "input_vrp": str(vrp_path),
-            "K_init": len(cluster_nums),
-            "K_final": len(clusters),
+            "depot": {"x": depot_x, "y": depot_y},
+            "capacity": capacity,
+            "K_init": int(len(cluster_nums)),
+            "K_final": int(len(clusters)),
+            "perms": perms,
+            "params": {
+                "anneal_ms": int(args.anneal_ms),
+                "nt": int(args.nt),
+                "p": float(args.p),
+                "q": float(args.q),
+                "lam": float(args.lam),
+                "alpha": float(args.alpha),
+                "stage2_mode": args.stage2_mode,
+                "max_iter": int(args.max_iter),
+            },
             "time_sweep_ms": float(time_sweep_ms),
             "time_perms_ms": float(time_perms_ms),
             "time_iteration_ms": float(time_iteration_ms),
-            "time_routing_ms": float(time_routing_ms) if time_routing_ms is not None else None,
             "time_total_ms": float(ms(t_all0, t_all1)),
-            "params": {
-                "anneal_ms": args.anneal_ms,
-                "nt": args.nt,
-                "p": args.p,
-                "q": args.q,
-                "lam": args.lam,
-                "alpha": args.alpha,
-                "stage2_mode": args.stage2_mode,
-                "max_iter": args.max_iter,
-            },
-            "final_total_distance": total_distance,
+            "last_iteration": int(iteration),
         }
         with (save_dir / "final_summary.json").open("w") as f:
-            json.dump(summary, f, indent=2, default=to_native)
+            json.dump(final_summary, f, indent=2, default=to_native)
 
         print(f"\n✅ Done: {instance_name}")
         print(f"📂 Output: {save_dir}")
         print(f"   sweep_ms={time_sweep_ms:.3f}  perms_ms={time_perms_ms:.3f}  iter_ms={time_iteration_ms:.3f}")
-        if args.routing:
-            print(f"   routing_ms={time_routing_ms:.3f}  total_dist={total_distance}")
+        print(f"   wrote iteration_0..iteration_{iteration}.json (Concorde routes)")
 
     except (ValueError, MemoryError) as e:
         msg = f"SKIP {instance_name}: {type(e).__name__}: {e}"

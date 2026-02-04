@@ -52,10 +52,7 @@ def safe_name(s: str) -> str:
 
 def parse_lam_alpha_from_path(p: Path):
     """
-    ex19_sweep_lam_alpha のパス例:
-      .../ex19_sweep_lam_alpha/lam_0_5/alpha_10_0/2026.../Leuven2_before_data/...
-    ここから lam/alpha を float として抽出する。
-    見つからなければ None。
+    lam_*/alpha_* を含むパスなら拾う（無ければ None）
     """
     lam = None
     alpha = None
@@ -75,14 +72,31 @@ def parse_lam_alpha_from_path(p: Path):
     return lam_f, alpha_f
 
 
-def find_timestamp_for_before_data(before_dir: Path):
+def find_timestamp_for_run_dir(run_dir: Path) -> str:
     """
-    before_dir = .../<timestamp>/<instance>_before_data
+    run_dir = .../<timestamp>/<instance>_before_data  or  .../<timestamp>/<instance>_sweep_qubo
     timestamp を 1 つ上のディレクトリ名として取得する。
     """
-    if before_dir.parent is not None:
-        return before_dir.parent.name
-    return ""
+    return run_dir.parent.name if run_dir.parent is not None else ""
+
+
+def is_iteration_json(p: Path) -> bool:
+    """
+    iteration_<num>.json だけを True にする。
+    除外:
+      - iteration_<num>_swap.json
+      - iteration_<num>_meta.json
+      - iteration_<num>_swap_timings.json 等
+    """
+    if not (p.is_file() and p.suffix == ".json"):
+        return False
+    m = re.fullmatch(r"iteration_(\d+)\.json", p.name)
+    return m is not None
+
+
+def iteration_index(p: Path) -> int:
+    m = re.fullmatch(r"iteration_(\d+)\.json", p.name)
+    return int(m.group(1)) if m else -1
 
 
 def scan_and_plot(base_dir: str, output_index=True):
@@ -91,31 +105,35 @@ def scan_and_plot(base_dir: str, output_index=True):
         print(f"❌ 指定ディレクトリが存在しません: {base}")
         return
 
-    # ✅ ここが肝：再帰的に *_before_data を全部拾う（ex19構造に対応）
-    before_dirs = sorted([p for p in base.rglob("*_before_data") if p.is_dir()])
+    # ✅ *_before_data と *_sweep_qubo を両方拾う
+    run_dirs = []
+    run_dirs += [p for p in base.rglob("*_before_data") if p.is_dir()]
+    run_dirs += [p for p in base.rglob("*_sweep_qubo") if p.is_dir()]
+    run_dirs = sorted(set(run_dirs))
 
-    if not before_dirs:
-        print("⚠️ *_before_data が見つかりませんでした。base を確認してください。")
+    if not run_dirs:
+        print("⚠️ *_before_data / *_sweep_qubo が見つかりませんでした。base を確認してください。")
         print(f"   base={base}")
         return
 
     summary_rows = []
 
-    for inst_dir in before_dirs:
-        instance = inst_dir.name.replace("_before_data", "")
-        ts = find_timestamp_for_before_data(inst_dir)  # 例: 20260121_155519
-        lam, alpha = parse_lam_alpha_from_path(inst_dir)
+    for run_dir in run_dirs:
+        # instance name
+        if run_dir.name.endswith("_before_data"):
+            instance = run_dir.name.replace("_before_data", "")
+        elif run_dir.name.endswith("_sweep_qubo"):
+            instance = run_dir.name.replace("_sweep_qubo", "")
+        else:
+            instance = run_dir.name
 
-        # iteration_X.json を拾う（timings除外）
+        ts = find_timestamp_for_run_dir(run_dir)
+        lam, alpha = parse_lam_alpha_from_path(run_dir)
+
+        # iteration_<num>.json だけ拾う
         itr_files = sorted(
-            [
-                f for f in inst_dir.iterdir()
-                if f.is_file()
-                and f.name.startswith("iteration_")
-                and f.suffix == ".json"
-                and "timings" not in f.name
-            ],
-            key=lambda p: int(p.stem.split("_")[1])
+            [f for f in run_dir.iterdir() if is_iteration_json(f)],
+            key=iteration_index
         )
 
         if not itr_files:
@@ -123,7 +141,7 @@ def scan_and_plot(base_dir: str, output_index=True):
 
         xs, ys = [], []
         for f in itr_files:
-            it = int(f.stem.split("_")[1])
+            it = iteration_index(f)
             dist = extract_total_distance(f)
             xs.append(it)
             ys.append(dist)
@@ -136,19 +154,19 @@ def scan_and_plot(base_dir: str, output_index=True):
                 "iteration": it,
                 "total_distance": dist,
                 "json_path": str(f),
+                "run_dir": str(run_dir),
             })
 
-        # 出力ファイル名（lam/alphaも入れて衝突しにくく）
         lam_s = "lamNA" if lam is None else f"lam{safe_name(str(lam))}"
         alpha_s = "alphaNA" if alpha is None else f"alpha{safe_name(str(alpha))}"
         fname_base = f"{safe_name(instance)}__{safe_name(ts)}__{lam_s}__{alpha_s}"
 
-        png = inst_dir / f"improvement_curve__{fname_base}.png"
+        png = run_dir / f"improvement_curve__{fname_base}.png"
         title = f"Improvement — {instance} | ts={ts} | lam={lam} | alpha={alpha}"
         plot_curve(xs, ys, title, png)
         print(f"📈 Saved: {png}")
 
-        csv_path = inst_dir / f"improvement_curve__{fname_base}.csv"
+        csv_path = run_dir / f"improvement_curve__{fname_base}.csv"
         with csv_path.open("w", newline="") as cf:
             writer = csv.writer(cf)
             writer.writerow(["iteration", "total_distance"])
@@ -159,7 +177,7 @@ def scan_and_plot(base_dir: str, output_index=True):
     if summary_rows and output_index:
         out_csv = base / "all_runs_summary.csv"
         with out_csv.open("w", newline="") as cf:
-            fieldnames = ["lam", "alpha", "timestamp", "instance", "iteration", "total_distance", "json_path"]
+            fieldnames = ["lam", "alpha", "timestamp", "instance", "iteration", "total_distance", "json_path", "run_dir"]
             writer = csv.DictWriter(cf, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(summary_rows)
@@ -168,11 +186,11 @@ def scan_and_plot(base_dir: str, output_index=True):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Plot improvement curves under ex19 (lam/alpha/timestamp/*_before_data) folders"
+        description="Plot improvement curves under folders containing *_before_data or *_sweep_qubo"
     )
     ap.add_argument(
         "-b", "--base", required=True,
-        help="Base folder that contains lam_*/alpha_*/timestamp/*_before_data (e.g., ./out/ex19_sweep_lam_alpha)"
+        help="Base folder that contains timestamp/*_before_data or timestamp/*_sweep_qubo"
     )
     args = ap.parse_args()
     scan_and_plot(args.base)
